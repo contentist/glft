@@ -1,0 +1,17 @@
+[package]
+name = "glft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "glft"
+path = "src/main.rs"
+
+[dependencies]
+glft-core.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+chrono.workspace = true

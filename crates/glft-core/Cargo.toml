@@ -1,0 +1,24 @@
+[package]
+name = "glft-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iroh.workspace = true
+iroh-mdns-address-lookup.workspace = true
+tokio.workspace = true
+blake3.workspace = true
+bao-tree.workspace = true
+iroh-io.workspace = true
+bytes.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+directories.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

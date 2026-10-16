@@ -1,0 +1,284 @@
+//! The manifest: what is being sent, with a BLAKE3 fingerprint for every file.
+//!
+//! Paths are relative and use `/`, so a folder arrives as that folder. The receiver
+//! checks every path before anything is written ([`Manifest::validate`]).
+
+use std::{
+    collections::HashSet,
+    fs,
+    io::BufReader,
+    path::{Path, PathBuf},
+};
+
+use bao_tree::{
+    BaoTree, BlockSize,
+    io::{
+        outboard::{PreOrderMemOutboard, PreOrderOutboard},
+        sync::CreateOutboard,
+    },
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    error::{Error, ErrorKind},
+    events::Totals,
+};
+
+/// Verification granularity: 16 KiB chunk groups, as iroh-blobs uses.
+pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
+
+/// Name of the folder inside the receive folder that holds files still arriving.
+pub const PARTIAL_DIR: &str = ".glft-partial";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Root {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Relative path, `/`-separated, starting with its root's name.
+    pub path: String,
+    pub size: u64,
+    /// BLAKE3 hash of the whole file.
+    pub hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Manifest {
+    /// The items the user chose, by name.
+    pub roots: Vec<Root>,
+    /// Every folder below a folder root, including empty ones, so structure survives.
+    pub dirs: Vec<String>,
+    pub files: Vec<FileEntry>,
+}
+
+/// Sender-side data for one file: where it is and its verification tree.
+pub struct Source {
+    pub path: PathBuf,
+    pub outboard: PreOrderMemOutboard,
+}
+
+impl Manifest {
+    pub fn totals(&self) -> Totals {
+        Totals {
+            folders: self.roots.iter().filter(|r| r.is_dir).count(),
+            files: self.files.len(),
+            bytes: self.files.iter().map(|f| f.size).sum(),
+        }
+    }
+
+    /// Receiver-side check of everything the sender claims.
+    ///
+    /// Every path must be relative, free of `..`, `.` and empty segments, and sit
+    /// under one of the declared roots; no path may appear twice.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.roots.is_empty() {
+            return Err(Error::new(ErrorKind::ProtocolError, "offer has no items"));
+        }
+        let mut roots = HashSet::new();
+        for root in &self.roots {
+            check_rel_path(&root.name)?;
+            if root.name.contains('/') || root.name == PARTIAL_DIR {
+                return Err(unsafe_path(&root.name));
+            }
+            if !roots.insert(root.name.as_str()) {
+                return Err(Error::new(ErrorKind::ProtocolError, format!("item {:?} listed twice", root.name)));
+            }
+        }
+        let mut seen = HashSet::new();
+        let paths = self.dirs.iter().map(|d| (d, true)).chain(self.files.iter().map(|f| (&f.path, false)));
+        for (path, is_dir) in paths {
+            check_rel_path(path)?;
+            let first = path.split('/').next().unwrap_or_default();
+            let root = self.roots.iter().find(|r| r.name == first).ok_or_else(|| unsafe_path(path))?;
+            // A file root is exactly one file; anything else must be inside a folder root.
+            let fits = if root.is_dir { is_dir || path.len() > first.len() } else { !is_dir && path == first };
+            if !fits || !seen.insert(path.as_str()) {
+                return Err(unsafe_path(path));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn unsafe_path(path: &str) -> Error {
+    Error::new(ErrorKind::UnsafePath, format!("offered path {path:?}"))
+}
+
+/// Checks one relative path as received from the network.
+pub fn check_rel_path(path: &str) -> Result<(), Error> {
+    if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains('\0') {
+        return Err(unsafe_path(path));
+    }
+    if path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+        return Err(unsafe_path(path));
+    }
+    Ok(())
+}
+
+/// Builds the manifest for the chosen files and folders, hashing every file.
+///
+/// Blocking: call it from `spawn_blocking`. Symbolic links are skipped.
+pub fn build(inputs: &[PathBuf]) -> Result<(Manifest, Vec<Source>), Error> {
+    if inputs.is_empty() {
+        return Err(Error::new(ErrorKind::NothingToSend, "no paths given"));
+    }
+    let mut manifest = Manifest::default();
+    let mut sources = Vec::new();
+    for input in inputs {
+        let abs = fs::canonicalize(input).map_err(|e| Error::io(ErrorKind::SourceUnreadable, input, e))?;
+        let name = file_name_text(&abs)?;
+        if manifest.roots.iter().any(|r| r.name == name) {
+            return Err(Error::new(ErrorKind::DuplicateName, name));
+        }
+        let meta = fs::metadata(&abs).map_err(|e| Error::io(ErrorKind::SourceUnreadable, &abs, e))?;
+        if meta.is_dir() {
+            manifest.roots.push(Root { name: name.clone(), is_dir: true });
+            let mut walk: Vec<_> = walkdir::WalkDir::new(&abs)
+                .min_depth(1)
+                .sort_by_file_name()
+                .into_iter()
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    let path = e.path().unwrap_or(&abs).to_path_buf();
+                    Error::new(ErrorKind::SourceUnreadable, format!("{}: {e}", path.display()))
+                })?;
+            walk.retain(|e| !e.path_is_symlink());
+            for entry in walk {
+                let rel = entry.path().strip_prefix(&abs).expect("walkdir stays under its root");
+                let rel = format!("{name}/{}", rel_text(rel)?);
+                if entry.file_type().is_dir() {
+                    manifest.dirs.push(rel);
+                } else if entry.file_type().is_file() {
+                    let (file, source) = hash_file(entry.path(), rel)?;
+                    manifest.files.push(file);
+                    sources.push(source);
+                }
+            }
+        } else {
+            manifest.roots.push(Root { name: name.clone(), is_dir: false });
+            let (file, source) = hash_file(&abs, name)?;
+            manifest.files.push(file);
+            sources.push(source);
+        }
+    }
+    Ok((manifest, sources))
+}
+
+fn hash_file(path: &Path, rel: String) -> Result<(FileEntry, Source), Error> {
+    let err = |e| Error::io(ErrorKind::SourceUnreadable, path, e);
+    let file = fs::File::open(path).map_err(err)?;
+    let size = file.metadata().map_err(err)?.len();
+    let ob = PreOrderOutboard::<Vec<u8>>::create_sized(BufReader::with_capacity(1 << 20, file), size, BLOCK_SIZE)
+        .map_err(err)?;
+    let outboard = PreOrderMemOutboard { root: ob.root, tree: BaoTree::new(size, BLOCK_SIZE), data: ob.data };
+    let entry = FileEntry { path: rel, size, hash: *ob.root.as_bytes() };
+    Ok((entry, Source { path: path.to_path_buf(), outboard }))
+}
+
+fn file_name_text(path: &Path) -> Result<String, Error> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::NothingToSend, format!("{} has no name", path.display())))?;
+    name.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| Error::new(ErrorKind::NameNotText, path.display().to_string()))
+}
+
+fn rel_text(rel: &Path) -> Result<String, Error> {
+    let parts: Option<Vec<&str>> = rel.components().map(|c| c.as_os_str().to_str()).collect();
+    parts
+        .map(|p| p.join("/"))
+        .ok_or_else(|| Error::new(ErrorKind::NameNotText, rel.display().to_string()))
+}
+
+/// Picks a name for `name` that is free in `dir`: `Album` → `Album (2)`,
+/// `song.flac` → `song (2).flac`.
+pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
+    if fs::symlink_metadata(dir.join(name)).is_err() {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if !is_dir && i > 0 => name.split_at(i),
+        _ => (name, ""),
+    };
+    (2..)
+        .map(|n| format!("{stem} ({n}){ext}"))
+        .find(|candidate| fs::symlink_metadata(dir.join(candidate)).is_err())
+        .expect("an unused name exists")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_paths() {
+        for bad in ["", "/etc/passwd", "../x", "a/../../x", "a/./b", "a//b", "a/", "a\\b", "..", "a\0b"] {
+            assert!(check_rel_path(bad).is_err(), "{bad:?} should be refused");
+        }
+        for good in ["a", "Album/track01.flac", "a b/c.d", "..hidden", "x..y"] {
+            assert!(check_rel_path(good).is_ok(), "{good:?} should pass");
+        }
+    }
+
+    fn offer(roots: &[(&str, bool)], dirs: &[&str], files: &[&str]) -> Manifest {
+        Manifest {
+            roots: roots.iter().map(|(n, d)| Root { name: n.to_string(), is_dir: *d }).collect(),
+            dirs: dirs.iter().map(|s| s.to_string()).collect(),
+            files: files.iter().map(|p| FileEntry { path: p.to_string(), size: 0, hash: [0; 32] }).collect(),
+        }
+    }
+
+    #[test]
+    fn validate_ties_paths_to_roots() {
+        assert!(offer(&[("Album", true)], &["Album/cd1"], &["Album/cd1/a.flac"]).validate().is_ok());
+        assert!(offer(&[("a.txt", false)], &[], &["a.txt"]).validate().is_ok());
+        // outside any root
+        assert!(offer(&[("Album", true)], &[], &["Other/a"]).validate().is_err());
+        // a file root cannot hold more files
+        assert!(offer(&[("a.txt", false)], &[], &["a.txt/b"]).validate().is_err());
+        // a folder root cannot also be a file
+        assert!(offer(&[("Album", true)], &[], &["Album"]).validate().is_err());
+        // duplicates and the partial folder
+        assert!(offer(&[("Album", true)], &[], &["Album/a", "Album/a"]).validate().is_err());
+        assert!(offer(&[(PARTIAL_DIR, true)], &[], &[".glft-partial/x"]).validate().is_err());
+        assert!(offer(&[("Album", true)], &[], &["Album/../../.bashrc"]).validate().is_err());
+    }
+
+    #[test]
+    fn free_names() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(free_name(dir.path(), "Album", true), "Album");
+        fs::create_dir(dir.path().join("Album")).unwrap();
+        assert_eq!(free_name(dir.path(), "Album", true), "Album (2)");
+        fs::create_dir(dir.path().join("Album (2)")).unwrap();
+        assert_eq!(free_name(dir.path(), "Album", true), "Album (3)");
+        fs::write(dir.path().join("song.flac"), b"").unwrap();
+        assert_eq!(free_name(dir.path(), "song.flac", false), "song (2).flac");
+        fs::write(dir.path().join(".bashrc"), b"").unwrap();
+        assert_eq!(free_name(dir.path(), ".bashrc", false), ".bashrc (2)");
+    }
+
+    #[test]
+    fn manifest_of_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let album = dir.path().join("Album");
+        fs::create_dir_all(album.join("cd1")).unwrap();
+        fs::create_dir_all(album.join("empty")).unwrap();
+        fs::write(album.join("cd1/a.flac"), b"hello").unwrap();
+        fs::write(album.join("cover.jpg"), vec![7u8; 100_000]).unwrap();
+        let (m, sources) = build(&[album]).unwrap();
+        assert_eq!(m.roots, vec![Root { name: "Album".into(), is_dir: true }]);
+        assert_eq!(m.dirs, vec!["Album/cd1", "Album/empty"]);
+        let paths: Vec<_> = m.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["Album/cd1/a.flac", "Album/cover.jpg"]);
+        assert_eq!(m.files[0].hash, *blake3::hash(b"hello").as_bytes());
+        assert_eq!(m.files[1].hash, *blake3::hash(&[7u8; 100_000]).as_bytes());
+        assert_eq!(sources.len(), 2);
+        assert!(m.validate().is_ok());
+        assert_eq!(m.totals(), Totals { folders: 1, files: 2, bytes: 100_005 });
+    }
+}

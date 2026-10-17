@@ -3,7 +3,7 @@
 //! The terminal program prints these as they happen, and the window and the phone
 //! will show the same sentences. The sink stamps the time, so events carry none.
 
-use std::{fmt, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{fmt, net::SocketAddr, sync::Arc};
 
 use crate::error::Error;
 
@@ -37,16 +37,18 @@ pub enum Event {
     KeyCreated { id: String },
     PortInUse { port: u16, holder: Option<String>, actual: u16 },
     Listening { addrs: Vec<SocketAddr> },
-    ReceiveFolder { dir: PathBuf },
+    ReceiveFolder { dir: String },
     Hashing { items: usize },
     Connecting { peer: String },
     Connected { peer: String },
     Offered { peer: String, totals: Totals },
-    OfferReceived { peer: String, totals: Totals, dest: PathBuf },
+    OfferReceived { peer: String, totals: Totals, dest: String },
+    Missed { peer: String, totals: Totals },
+    Refused { peer: String },
     Accepted { peer: String },
     Declined { peer: String },
     Renamed { from: String, to: String },
-    FileVerified { path: String, saved_to: PathBuf },
+    FileVerified { path: String, saved_to: String },
     FileSent { path: String },
     Finished { peer: String, totals: Totals, secs: f64 },
     Failed(Error),
@@ -68,22 +70,22 @@ impl fmt::Display for Event {
                 let list: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
                 write!(f, "Listening on {}", list.join(", "))
             }
-            Self::ReceiveFolder { dir } => write!(f, "Files will be saved to {}", dir.display()),
+            Self::ReceiveFolder { dir } => write!(f, "Files will be saved to {dir}"),
             Self::Hashing { items } => {
                 write!(f, "Reading {} and computing fingerprints", plural(*items, "item"))
             }
             Self::Connecting { peer } => write!(f, "Connecting to {peer}"),
             Self::Connected { peer } => write!(f, "Connected to {peer}; its key matches"),
-            Self::Offered { peer, totals } => write!(f, "Offered {totals} to {peer}"),
-            Self::OfferReceived { peer, totals, dest } => {
-                write!(f, "{peer} offers {totals}, to be saved to {}", dest.display())
+            Self::Offered { peer, totals } => write!(f, "Offered {totals} to {peer}; waiting for an answer"),
+            Self::OfferReceived { peer, totals, dest } => write!(f, "{peer} offers {totals}, to be saved to {dest}"),
+            Self::Missed { peer, totals } => write!(f, "Missed: {peer} stopped waiting before {totals} could be accepted"),
+            Self::Refused { peer } => {
+                write!(f, "Refused a connection from {peer}, a device this one is not paired with")
             }
             Self::Accepted { peer } => write!(f, "{peer} accepted"),
             Self::Declined { peer } => write!(f, "{peer} declined"),
             Self::Renamed { from, to } => write!(f, "\"{from}\" already exists here; saving as \"{to}\""),
-            Self::FileVerified { path, saved_to } => {
-                write!(f, "{path} verified, saved to {}", saved_to.display())
-            }
+            Self::FileVerified { path, saved_to } => write!(f, "{path} verified, saved to {saved_to}"),
             Self::FileSent { path } => write!(f, "{path} sent"),
             Self::Finished { peer, totals, secs } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };

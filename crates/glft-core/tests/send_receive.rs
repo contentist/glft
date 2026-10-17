@@ -11,7 +11,8 @@ use glft_core::{
     Event, ErrorKind,
     events::EventSink,
     net,
-    transfer::{self, Decide, ReceiveOptions},
+    storage::FsStorage,
+    transfer::{self, Authorize, Decide, ReceiveOptions},
 };
 use iroh::SecretKey;
 
@@ -19,6 +20,10 @@ fn collecting() -> (EventSink, Arc<Mutex<Vec<String>>>) {
     let log = Arc::new(Mutex::new(Vec::new()));
     let sink_log = log.clone();
     (Arc::new(move |e: Event| sink_log.lock().unwrap().push(e.to_string())), log)
+}
+
+fn allow_all() -> Authorize {
+    Arc::new(|_| true)
 }
 
 fn answer(accept: bool) -> Decide {
@@ -75,11 +80,20 @@ fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
 }
 
 async fn receiver(dest: &Path, decide: Decide) -> (iroh::Endpoint, iroh::EndpointAddr, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    receiver_with(dest, decide, allow_all()).await
+}
+
+async fn receiver_with(
+    dest: &Path,
+    decide: Decide,
+    authorize: Authorize,
+) -> (iroh::Endpoint, iroh::EndpointAddr, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
     let (events, log) = collecting();
     let ep = net::bind(SecretKey::generate(), Some(0), &events).await.unwrap();
     let port = ep.bound_sockets()[0].port();
     let addr = net::peer_addr(ep.id(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
-    let opts = ReceiveOptions { dir: dest.to_path_buf(), decide, once: true };
+    let storage = Arc::new(FsStorage::new(dest.to_path_buf()).unwrap());
+    let opts = ReceiveOptions { storage, decide, authorize, once: true };
     let ep2 = ep.clone();
     let task = tokio::spawn(async move { transfer::serve(&ep2, &opts, &events).await.unwrap() });
     (ep, addr, task, log)
@@ -103,7 +117,8 @@ async fn folder_arrives_verified_with_structure() {
     assert_eq!(totals.files, 5);
     assert_eq!(tree_hashes(&album), tree_hashes(&dest.path().join("Album (2)")));
     assert_eq!(fs::read(dest.path().join("notes.txt")).unwrap(), b"hello");
-    assert!(!dest.path().join(".glft-partial").exists());
+    let leftovers: Vec<_> = walkdir(dest.path()).into_iter().filter(|p| p.to_string_lossy().ends_with(".glft-part")).collect();
+    assert!(leftovers.is_empty(), "partials left behind: {leftovers:?}");
 
     let rx_log = rx_log.lock().unwrap().join("\n");
     assert!(rx_log.contains("offers 1 folder, 5 files"), "{rx_log}");
@@ -135,4 +150,51 @@ async fn unreachable_peer_is_explained() {
     fs::write(src.path().join("a"), b"x").unwrap();
     let err = transfer::send(&tx, addr, vec![src.path().join("a")], &glft_core::events::discard()).await.unwrap_err();
     assert_eq!(err.kind, ErrorKind::PeerUnreachable);
+}
+
+#[tokio::test]
+async fn unpaired_device_is_refused_before_any_offer() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let album = make_album(src.path());
+    let asked = Arc::new(Mutex::new(false));
+    let asked2 = asked.clone();
+    let decide: Decide = Arc::new(move |_| {
+        *asked2.lock().unwrap() = true;
+        Box::pin(async { true })
+    });
+    let deny: Authorize = Arc::new(|_| false);
+    let (_rx_ep, addr, rx_task, rx_log) = receiver_with(dest.path(), decide, deny).await;
+    let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
+    let err = transfer::send(&tx, addr, vec![album], &quiet()).await.unwrap_err();
+    assert_eq!(err.kind, ErrorKind::NotPaired, "{err:?}");
+    rx_task.abort();
+    assert!(!*asked.lock().unwrap(), "an unpaired device must never reach the accept question");
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+    let rx_log = rx_log.lock().unwrap().join("\n");
+    assert!(rx_log.contains("not paired with"), "{rx_log}");
+}
+
+#[tokio::test]
+async fn offer_left_unanswered_becomes_missed_when_sender_gives_up() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let album = make_album(src.path());
+    let never: Decide = Arc::new(|_| Box::pin(std::future::pending()));
+    let (_rx_ep, addr, rx_task, rx_log) = receiver(dest.path(), never).await;
+    let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
+    let tx2 = tx.clone();
+    let sending = tokio::spawn(async move { transfer::send(&tx2, addr, vec![album], &quiet()).await });
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(!sending.is_finished(), "the sender keeps waiting while nobody answers");
+    sending.abort();
+    tx.close().await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), rx_task).await.unwrap().unwrap();
+    let rx_log = rx_log.lock().unwrap().join("\n");
+    assert!(rx_log.contains("Missed:"), "{rx_log}");
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+fn quiet() -> EventSink {
+    glft_core::events::discard()
 }

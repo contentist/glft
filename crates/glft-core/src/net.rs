@@ -77,7 +77,17 @@ pub async fn bind_ephemeral(secret: SecretKey) -> Result<Endpoint, Error> {
 }
 
 async fn build(secret: SecretKey, port: u16) -> Result<Endpoint, Error> {
-    let bind_err = |e: &dyn std::fmt::Display| Error::new(ErrorKind::BindFailed, e.to_string());
+    // Refused outright (EPERM/EACCES) means the platform withholds network access from the
+    // app, e.g. GrapheneOS's Network permission; anything else is a plain bind failure.
+    let bind_err = |e: &dyn std::error::Error| {
+        let detail = chain(e);
+        let kind = if classify_unreachable(&detail) == ErrorKind::LocalNetworkBlocked {
+            ErrorKind::NetworkDenied
+        } else {
+            ErrorKind::BindFailed
+        };
+        Error::new(kind, detail)
+    };
     Endpoint::builder(presets::Minimal)
         .secret_key(secret)
         .alpns(vec![ALPN.to_vec()])
@@ -98,6 +108,31 @@ async fn build(secret: SecretKey, port: u16) -> Result<Endpoint, Error> {
 
 fn local_port(endpoint: &Endpoint) -> u16 {
     endpoint.bound_sockets().first().map(|a| a.port()).unwrap_or(0)
+}
+
+/// An error with all its causes: "Failed to bind sockets: mDNS: Permission denied".
+pub fn chain(e: &dyn std::error::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        let part = cause.to_string();
+        if !text.contains(&part) {
+            text.push_str(": ");
+            text.push_str(&part);
+        }
+        source = cause.source();
+    }
+    text
+}
+
+/// Tells a blocked network apart from a device that is simply not there.
+///
+/// Android cuts apps off from the local network unless they hold the local network
+/// permission: UDP sends then fail with EPERM ("Operation not permitted"), and GrapheneOS's
+/// Network permission gives EACCES ("Permission denied").
+pub fn classify_unreachable(detail: &str) -> ErrorKind {
+    let blocked = ["Operation not permitted", "os error 1)", "Permission denied", "os error 13)"];
+    if blocked.iter().any(|b| detail.contains(b)) { ErrorKind::LocalNetworkBlocked } else { ErrorKind::PeerUnreachable }
 }
 
 /// Parses a device id as printed by `glft id`.
@@ -155,6 +190,13 @@ pub fn udp_port_holder(port: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_network_is_named() {
+        assert_eq!(classify_unreachable("sendmsg: Operation not permitted (os error 1)"), ErrorKind::LocalNetworkBlocked);
+        assert_eq!(classify_unreachable("Permission denied (os error 13)"), ErrorKind::LocalNetworkBlocked);
+        assert_eq!(classify_unreachable("timed out"), ErrorKind::PeerUnreachable);
+    }
 
     #[test]
     fn finds_own_socket_as_holder() {

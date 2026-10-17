@@ -10,10 +10,11 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use glft_core::{
-    Error, Event,
+    Error, ErrorKind, Event,
     events::EventSink,
     identity, net, paths,
-    transfer::{self, Decide, IncomingOffer, ReceiveOptions},
+    storage::FsStorage,
+    transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions},
 };
 
 #[derive(Parser)]
@@ -97,7 +98,11 @@ async fn run(command: Command, events: &EventSink) -> Result<(), Error> {
             }
             println!();
             let decide: Decide = if yes { Arc::new(|_| Box::pin(async { true })) } else { Arc::new(ask) };
-            let opts = ReceiveOptions { dir, decide, once };
+            let storage = FsStorage::new(dir.clone()).map_err(|e| Error::io(ErrorKind::ReceiveDirUnwritable, &dir, e))?;
+            // Pairing arrives on Day 3; until then every device may make an offer, and each
+            // offer is still asked about unless --yes is given.
+            let authorize: Authorize = Arc::new(|_| true);
+            let opts = ReceiveOptions { storage: Arc::new(storage), decide, authorize, once };
             let result = tokio::select! {
                 r = transfer::serve(&endpoint, &opts, events) => r,
                 _ = tokio::signal::ctrl_c() => Ok(()),
@@ -133,7 +138,7 @@ fn lan_rank(addr: &SocketAddr) -> u8 {
 fn ask(offer: IncomingOffer) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
     Box::pin(async move {
         tokio::task::spawn_blocking(move || {
-            print!("{:>10}  Accept {} from {} into {}? [y/N] ", "", offer.totals, offer.peer, offer.dest.display());
+            print!("{:>10}  Accept {} from {} into {}? [y/N] ", "", offer.totals, offer.peer, offer.dest);
             let _ = std::io::stdout().flush();
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line).ok();

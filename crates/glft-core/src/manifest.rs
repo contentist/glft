@@ -27,8 +27,8 @@ use crate::{
 /// Verification granularity: 16 KiB chunk groups, as iroh-blobs uses.
 pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(4);
 
-/// Name of the folder inside the receive folder that holds files still arriving.
-pub const PARTIAL_DIR: &str = ".glft-partial";
+/// Files still arriving are named `.<name>` plus this; offered names may not end in it.
+pub const PARTIAL_SUFFIX: &str = ".glft-part";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Root {
@@ -80,7 +80,7 @@ impl Manifest {
         let mut roots = HashSet::new();
         for root in &self.roots {
             check_rel_path(&root.name)?;
-            if root.name.contains('/') || root.name == PARTIAL_DIR {
+            if root.name.contains('/') {
                 return Err(unsafe_path(&root.name));
             }
             if !roots.insert(root.name.as_str()) {
@@ -112,7 +112,7 @@ pub fn check_rel_path(path: &str) -> Result<(), Error> {
     if path.is_empty() || path.starts_with('/') || path.contains('\\') || path.contains('\0') {
         return Err(unsafe_path(path));
     }
-    if path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+    if path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == ".." || seg.ends_with(PARTIAL_SUFFIX)) {
         return Err(unsafe_path(path));
     }
     Ok(())
@@ -194,10 +194,10 @@ fn rel_text(rel: &Path) -> Result<String, Error> {
         .ok_or_else(|| Error::new(ErrorKind::NameNotText, rel.display().to_string()))
 }
 
-/// Picks a name for `name` that is free in `dir`: `Album` → `Album (2)`,
+/// Picks a name for `name` that `taken` does not report: `Album` → `Album (2)`,
 /// `song.flac` → `song (2).flac`.
-pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
-    if fs::symlink_metadata(dir.join(name)).is_err() {
+pub fn free_name(name: &str, is_dir: bool, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
         return name.to_string();
     }
     let (stem, ext) = match name.rfind('.') {
@@ -206,7 +206,7 @@ pub fn free_name(dir: &Path, name: &str, is_dir: bool) -> String {
     };
     (2..)
         .map(|n| format!("{stem} ({n}){ext}"))
-        .find(|candidate| fs::symlink_metadata(dir.join(candidate)).is_err())
+        .find(|candidate| !taken(candidate))
         .expect("an unused name exists")
 }
 
@@ -244,22 +244,19 @@ mod tests {
         assert!(offer(&[("Album", true)], &[], &["Album"]).validate().is_err());
         // duplicates and the partial folder
         assert!(offer(&[("Album", true)], &[], &["Album/a", "Album/a"]).validate().is_err());
-        assert!(offer(&[(PARTIAL_DIR, true)], &[], &[".glft-partial/x"]).validate().is_err());
+        assert!(offer(&[("Album", true)], &[], &["Album/.a.glft-part"]).validate().is_err());
         assert!(offer(&[("Album", true)], &[], &["Album/../../.bashrc"]).validate().is_err());
     }
 
     #[test]
     fn free_names() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(free_name(dir.path(), "Album", true), "Album");
-        fs::create_dir(dir.path().join("Album")).unwrap();
-        assert_eq!(free_name(dir.path(), "Album", true), "Album (2)");
-        fs::create_dir(dir.path().join("Album (2)")).unwrap();
-        assert_eq!(free_name(dir.path(), "Album", true), "Album (3)");
-        fs::write(dir.path().join("song.flac"), b"").unwrap();
-        assert_eq!(free_name(dir.path(), "song.flac", false), "song (2).flac");
-        fs::write(dir.path().join(".bashrc"), b"").unwrap();
-        assert_eq!(free_name(dir.path(), ".bashrc", false), ".bashrc (2)");
+        let taken = |names: &'static [&'static str]| move |n: &str| names.contains(&n);
+        assert_eq!(free_name("Album", true, taken(&[])), "Album");
+        assert_eq!(free_name("Album", true, taken(&["Album"])), "Album (2)");
+        assert_eq!(free_name("Album", true, taken(&["Album", "Album (2)"])), "Album (3)");
+        assert_eq!(free_name("song.flac", false, taken(&["song.flac"])), "song (2).flac");
+        assert_eq!(free_name("v1.2", true, taken(&["v1.2"])), "v1.2 (2)");
+        assert_eq!(free_name(".bashrc", false, taken(&[".bashrc"])), ".bashrc (2)");
     }
 
     #[test]

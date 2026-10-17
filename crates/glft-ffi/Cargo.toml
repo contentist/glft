@@ -1,0 +1,24 @@
+[package]
+name = "glft-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "glft_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["bindgen"]
+
+[features]
+bindgen = ["uniffi/cli"]
+
+[dependencies]
+glft-core.workspace = true
+iroh.workspace = true
+uniffi = { version = "=0.32.2", features = ["tokio"] }
+tokio.workspace = true

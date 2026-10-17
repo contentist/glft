@@ -30,8 +30,19 @@ pub fn default_receive_dir() -> Result<PathBuf, Error> {
     Ok(downloads.join("glft"))
 }
 
+static DEVICE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Sets the name shown to other devices, where the hostname is not it (Android: the
+/// phone's model or the name the user gave it). First call wins.
+pub fn set_device_name(name: String) {
+    let _ = DEVICE_NAME.set(name);
+}
+
 /// This device's name as shown to the other side.
 pub fn device_name() -> String {
+    if let Some(name) = DEVICE_NAME.get() {
+        return name.clone();
+    }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())

@@ -11,6 +11,7 @@ pub mod manifest;
 pub mod net;
 pub mod paths;
 pub mod proto;
+pub mod storage;
 pub mod transfer;
 
 pub use error::{Error, ErrorKind};

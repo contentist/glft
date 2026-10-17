@@ -5,9 +5,10 @@
 
 use std::{
     collections::HashSet,
-    fs,
+    fs, io,
     io::BufReader,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use bao_tree::{
@@ -56,8 +57,56 @@ pub struct Manifest {
 
 /// Sender-side data for one file: where it is and its verification tree.
 pub struct Source {
-    pub path: PathBuf,
+    pub file: SourceRef,
     pub outboard: PreOrderMemOutboard,
+}
+
+/// Opens files the core has no path for, such as files another Android app shared.
+pub trait SourceFiles: Send + Sync {
+    /// Opens file `index` (as numbered in the [`Item`]s) for reading from the start.
+    fn open(&self, index: usize) -> io::Result<fs::File>;
+}
+
+/// Where a file being sent is read from. It is opened again for every request, so a
+/// resumed transfer reads it afresh.
+#[derive(Clone)]
+pub enum SourceRef {
+    Path(PathBuf),
+    Opened(Arc<dyn SourceFiles>, usize),
+}
+
+impl SourceRef {
+    pub fn open(&self) -> io::Result<fs::File> {
+        match self {
+            Self::Path(path) => fs::File::open(path),
+            Self::Opened(files, index) => files.open(*index),
+        }
+    }
+
+    /// For error details.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::Opened(_, index) => format!("shared file {index}"),
+        }
+    }
+}
+
+/// Something chosen to send on a device without paths (the phone): one file, or a folder
+/// with everything below it.
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub name: String,
+    pub kind: ItemKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ItemKind {
+    /// The [`SourceFiles`] index of the file.
+    File(usize),
+    /// Everything below the folder: `/`-separated paths relative to it, each a file (with its
+    /// [`SourceFiles`] index) or a folder (`None`, kept so empty folders arrive too).
+    Folder(Vec<(String, Option<usize>)>),
 }
 
 impl Manifest {
@@ -168,14 +217,67 @@ pub fn build(inputs: &[PathBuf]) -> Result<(Manifest, Vec<Source>), Error> {
 }
 
 fn hash_file(path: &Path, rel: String) -> Result<(FileEntry, Source), Error> {
-    let err = |e| Error::io(ErrorKind::SourceUnreadable, path, e);
-    let file = fs::File::open(path).map_err(err)?;
-    let size = file.metadata().map_err(err)?.len();
+    hash_source(SourceRef::Path(path.to_path_buf()), rel)
+}
+
+fn hash_source(source: SourceRef, rel: String) -> Result<(FileEntry, Source), Error> {
+    let err = |e: io::Error| Error::new(ErrorKind::SourceUnreadable, format!("{}: {e}", source.describe()));
+    let file = source.open().map_err(err)?;
+    let meta = file.metadata().map_err(err)?;
+    if !meta.is_file() {
+        // A stream rather than a stored file: its size is unknown and it can't be reread.
+        return Err(Error::new(ErrorKind::SourceUnreadable, format!("{rel}: not a stored file")));
+    }
+    let size = meta.len();
     let ob = PreOrderOutboard::<Vec<u8>>::create_sized(BufReader::with_capacity(1 << 20, file), size, BLOCK_SIZE)
         .map_err(err)?;
     let outboard = PreOrderMemOutboard { root: ob.root, tree: BaoTree::new(size, BLOCK_SIZE), data: ob.data };
     let entry = FileEntry { path: rel, size, hash: *ob.root.as_bytes() };
-    Ok((entry, Source { path: path.to_path_buf(), outboard }))
+    Ok((entry, Source { file: source, outboard }))
+}
+
+/// Builds the manifest for items chosen on a device without paths, hashing every file.
+///
+/// Blocking. Names that clash (two shared files both called `image.jpg`) are told apart as
+/// `image (2).jpg`, since the person sharing can't rename them. Folder contents are sorted,
+/// so the same files always give the same manifest, and so resume after "send again".
+pub fn build_items(items: &[Item], files: Arc<dyn SourceFiles>) -> Result<(Manifest, Vec<Source>), Error> {
+    if items.is_empty() {
+        return Err(Error::new(ErrorKind::NothingToSend, "no items given"));
+    }
+    let mut manifest = Manifest::default();
+    let mut sources = Vec::new();
+    for item in items {
+        let base = item.name.replace(['/', '\\', '\0'], "_");
+        let is_dir = matches!(item.kind, ItemKind::Folder(_));
+        let name = free_name(&base, is_dir, |n| manifest.roots.iter().any(|r| r.name == n));
+        check_rel_path(&name)?;
+        manifest.roots.push(Root { name: name.clone(), is_dir });
+        match &item.kind {
+            ItemKind::File(index) => {
+                let (file, source) = hash_source(SourceRef::Opened(files.clone(), *index), name)?;
+                manifest.files.push(file);
+                sources.push(source);
+            }
+            ItemKind::Folder(entries) => {
+                let mut entries = entries.clone();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                for (rel, index) in entries {
+                    let rel = format!("{name}/{rel}");
+                    check_rel_path(&rel)?;
+                    match index {
+                        None => manifest.dirs.push(rel),
+                        Some(index) => {
+                            let (file, source) = hash_source(SourceRef::Opened(files.clone(), index), rel)?;
+                            manifest.files.push(file);
+                            sources.push(source);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((manifest, sources))
 }
 
 fn file_name_text(path: &Path) -> Result<String, Error> {

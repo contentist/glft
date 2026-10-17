@@ -24,7 +24,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.selection.SelectionContainer
@@ -59,7 +58,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import uniffi.glft_ffi.GlftException
-import uniffi.glft_ffi.LogLine
 import uniffi.glft_ffi.StorageChoice
 import uniffi.glft_ffi.coreVersion
 import java.text.SimpleDateFormat
@@ -70,6 +68,8 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         glft.inFront = true
+        // The VPN's lockdown can be switched while glft is away; look again.
+        Thread { glft.recheckNetwork() }.start()
     }
 
     override fun onStop() {
@@ -101,8 +101,15 @@ private fun Screen() {
     val devices by app.devices.collectAsStateWithLifecycle()
     val progress by app.progress.collectAsStateWithLifecycle()
     val received by app.received.collectAsStateWithLifecycle()
+    val sendState by app.sendState.collectAsStateWithLifecycle()
+    val net by app.net.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    // Chosen in a picker, waiting for "to which computer?".
+    var choosing by remember { mutableStateOf<Outgoing?>(null) }
+    // Set when the network explanation was shown for sending.
+    var forSending by remember { mutableStateOf(false) }
     var pairing by remember { mutableStateOf(false) }
+    var showLog by remember { mutableStateOf(false) }
     // Set when the network explanation was shown for pairing rather than receiving.
     var forPairing by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) { app.refreshDevices() }
@@ -121,7 +128,11 @@ private fun Screen() {
         explaining = false
         refused = Access.of(context).missingRuntime.isNotEmpty()
         if (!refused) {
-            if (forPairing) pairing = true else startReceiving()
+            when {
+                forSending -> {}
+                forPairing -> pairing = true
+                else -> startReceiving()
+            }
         }
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree: Uri? ->
@@ -132,8 +143,44 @@ private fun Screen() {
         }
     }
 
+    /** Reads what was picked off the main thread, then asks where to send it. */
+    fun prepare(read: () -> Outgoing) {
+        scope.launch {
+            try {
+                choosing = withContext(Dispatchers.IO) { read() }
+            } catch (e: Exception) {
+                app.note("Couldn't read what you picked: ${e.message}", isError = true)
+            }
+        }
+    }
+    val pickFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
+        if (uris.isNotEmpty()) prepare { context.contentResolver.outgoingFiles(uris) }
+    }
+    val pickFolder = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree: Uri? ->
+        if (tree != null) {
+            // Kept so a send that is stopped and started again can read the folder.
+            context.contentResolver.takePersistableUriPermission(tree, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            prepare { context.contentResolver.outgoingFolder(tree) }
+        }
+    }
+    /** Pickers need nothing, but sending needs the network; explain first if it's off. */
+    val whenNetworkAllowed = { pick: () -> Unit ->
+        val now = Access.of(context)
+        if (now.network && now.localNetwork) {
+            pick()
+        } else {
+            forSending = true
+            forPairing = false
+            explaining = true
+        }
+    }
+
     if (pairing) {
         PairScreen(onClose = { pairing = false; app.refreshDevices() })
+        return
+    }
+    if (showLog) {
+        LogScreen(onClose = { showLog = false })
         return
     }
 
@@ -146,6 +193,10 @@ private fun Screen() {
             Text("GrapheneOS local file transfer · core ${coreVersion()}", style = MaterialTheme.typography.bodySmall)
         }
 
+        if (net.wifiBlocked) {
+            item { VpnLockdownCard(devices) }
+        }
+
         item {
             Section("This device") {
                 SelectionContainer { Text(app.node.id(), style = MaterialTheme.typography.bodyMedium) }
@@ -153,6 +204,36 @@ private fun Screen() {
                     context.getSystemService(ClipboardManager::class.java)
                         .setPrimaryClip(ClipData.newPlainText("glft device id", app.node.id()))
                 }) { Text("Copy id") }
+            }
+        }
+
+        item {
+            Section("Send") {
+                val running = sendState is SendState.Running
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(enabled = !running, onClick = { whenNetworkAllowed { pickFiles.launch(arrayOf("*/*")) } }) { Text("Send files") }
+                    OutlinedButton(enabled = !running, onClick = { whenNetworkAllowed { pickFolder.launch(null) } }) { Text("Send a folder") }
+                }
+                Text("Or share from any app and choose glft.", style = MaterialTheme.typography.bodySmall)
+                if (forSending && (explaining || refused || !access.network)) {
+                    PermissionHelp(
+                        access = access,
+                        refused = refused,
+                        onContinue = { permissions.launch(access.missingRuntime.toTypedArray()) },
+                    )
+                }
+                choosing?.let { outgoing ->
+                    SendSheet(
+                        outgoing = outgoing,
+                        devices = devices,
+                        onSend = { device, route ->
+                            choosing = null
+                            Sends.start(context, device, outgoing, route)
+                        },
+                        onCancel = { choosing = null },
+                    )
+                }
+                SendStatus(sendState)
             }
         }
 
@@ -178,6 +259,7 @@ private fun Screen() {
                     Switch(checked = receiving, onCheckedChange = { on ->
                         val now = Access.of(context)
                         forPairing = false
+                        forSending = false
                         when {
                             !on -> context.startService(Intent(context, ReceiveService::class.java).setAction(ReceiveService.ACTION_STOP))
                             now.ready -> startReceiving()
@@ -186,7 +268,7 @@ private fun Screen() {
                         }
                     })
                 }
-                if (!forPairing && (explaining || refused || !access.network)) {
+                if (!forPairing && !forSending && (explaining || refused || !access.network)) {
                     PermissionHelp(
                         access = access,
                         refused = refused,
@@ -243,6 +325,7 @@ private fun Screen() {
                         pairing = true
                     } else {
                         forPairing = true
+                        forSending = false
                         explaining = true
                     }
                 }) { Text("Pair with a computer") }
@@ -312,9 +395,71 @@ private fun Screen() {
             }
         }
 
-        item { Text("What's happening", style = MaterialTheme.typography.titleMedium) }
-        items(log.asReversed()) { line -> LogRow(line) }
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("What's happening", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                TextButton(onClick = { showLog = true }) { Text("Show all") }
+            }
+        }
+        items(log.takeLast(3).asReversed()) { line -> LogRow(line) }
         item { Spacer(Modifier.padding(12.dp)) }
+    }
+}
+
+/** Shown while a VPN in lockdown cuts glft off from the local network. */
+@Composable
+private fun VpnLockdownCard(devices: List<uniffi.glft_ffi.PairedDevice>) {
+    val context = LocalContext.current
+    val meshDevices = devices.filter { it.mesh != null }
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Your VPN is blocking Wi-Fi transfers", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.error)
+            Text(
+                "Your VPN is set to \"Block connections without VPN\". While that's on, this phone can't send to your " +
+                    "computer over Wi-Fi, and your computer can't send to this phone over Wi-Fi.",
+            )
+            Text(
+                if (meshDevices.isNotEmpty()) {
+                    "You can still send over ${meshDevices.first().mesh}. To use Wi-Fi again, turn that setting off."
+                } else {
+                    "To use Wi-Fi again, turn that setting off."
+                },
+            )
+            OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }) { Text("Open VPN settings") }
+        }
+    }
+}
+
+/** How the current or last send is going. */
+@Composable
+private fun SendStatus(state: SendState) {
+    val context = LocalContext.current
+    when (state) {
+        SendState.Idle -> {}
+        is SendState.Running -> {
+            Text("Sending ${state.summary} to ${state.peer}", style = MaterialTheme.typography.bodyMedium)
+            LinearProgressIndicator(
+                progress = { if (state.total > 0) state.done.toFloat() / state.total.toFloat() else 0f },
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (state.done > 0) "${size(state.done.toULong())} of ${size(state.total.toULong())} sent" else "Reading the files and waiting for an answer",
+                    Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                TextButton(onClick = { context.glft.node.cancelSend() }) { Text("Cancel") }
+            }
+        }
+        is SendState.Done -> Text(
+            "✓ Sent to ${state.peer}${state.via?.let { " over $it" } ?: ""}: ${state.summary}, ${if (state.files == 1) "verified" else "all ${state.files} files verified"}",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        is SendState.Failed -> {
+            Text(state.headline, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+            Text(state.nextStep, style = MaterialTheme.typography.bodySmall)
+            Text("Details: ${state.detail}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -364,26 +509,11 @@ private fun PermissionHelp(access: Access, refused: Boolean, onContinue: () -> U
     }
 }
 
-@Composable
-private fun LogRow(line: LogLine) {
-    val time = remember(line.atUnixMs) { SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(line.atUnixMs)) }
-    val color = if (line.isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface
-    Row {
-        Text(time, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.width(10.dp))
-        Column {
-            Text(line.sentence, style = MaterialTheme.typography.bodyMedium, color = color)
-            line.nextStep?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
-            line.detail?.let { Text("Details: $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-        }
-    }
-}
-
 /**
  * GrapheneOS's Network toggle can't be read with checkSelfPermission: apps are told
  * INTERNET is granted either way, so they don't crash. Opening a socket tells the truth.
  */
-private fun networkAllowed(): Boolean = try {
+fun networkAllowed(): Boolean = try {
     java.net.DatagramSocket().close()
     true
 } catch (e: java.net.SocketException) {
@@ -413,7 +543,7 @@ private data class Access(val network: Boolean, val localNetwork: Boolean, val n
 }
 
 /** Sizes in decimal units, as the core and file managers show them. */
-private fun size(bytes: ULong): String {
+fun size(bytes: ULong): String {
     val units = listOf("KB", "MB", "GB", "TB")
     if (bytes < 1000u) return "$bytes bytes"
     var v = bytes.toDouble()

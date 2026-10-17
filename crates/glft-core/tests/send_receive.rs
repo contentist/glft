@@ -206,3 +206,86 @@ async fn offer_left_unanswered_becomes_missed_when_sender_gives_up() {
 fn quiet() -> EventSink {
     glft_core::events::discard()
 }
+
+/// Files opened by index, as the phone hands them over (it has no paths).
+struct Opened(Vec<std::path::PathBuf>);
+
+impl glft_core::manifest::SourceFiles for Opened {
+    fn open(&self, index: usize) -> std::io::Result<fs::File> {
+        fs::File::open(&self.0[index])
+    }
+}
+
+#[tokio::test]
+async fn items_without_paths_arrive_like_a_path_send() {
+    use glft_core::manifest::{self, Item, ItemKind};
+
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let album = make_album(src.path());
+    fs::write(src.path().join("notes.txt"), b"hello").unwrap();
+
+    // The album as the phone would list it: everything below it, files by index.
+    let mut opened = Vec::new();
+    let mut entries = Vec::new();
+    for p in walkdir(&album) {
+        let rel = p.strip_prefix(&album).unwrap().to_string_lossy().into_owned();
+        if p.is_dir() {
+            entries.push((rel, None));
+        } else {
+            entries.push((rel, Some(opened.len())));
+            opened.push(p);
+        }
+    }
+    opened.push(src.path().join("notes.txt"));
+    let items = vec![
+        Item { name: "Album".into(), kind: ItemKind::Folder(entries) },
+        Item { name: "notes.txt".into(), kind: ItemKind::File(opened.len() - 1) },
+    ];
+    let files: Arc<dyn manifest::SourceFiles> = Arc::new(Opened(opened));
+
+    // The same files give the same manifest as sending by path, so resume works across both.
+    let (by_path, _) = manifest::build(&[album.clone(), src.path().join("notes.txt")]).unwrap();
+    let (by_items, _) = manifest::build_items(&items, files.clone()).unwrap();
+    assert_eq!(by_path, by_items);
+
+    let (_rx_ep, addr, rx_task, _) = receiver(dest.path(), answer(true)).await;
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let seen = progress.clone();
+    let events: EventSink = Arc::new(move |e: Event| {
+        if let Event::SendProgress { done, total } = e {
+            seen.lock().unwrap().push((done, total));
+        }
+    });
+    let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
+    let outgoing = transfer::prepare_items(items, files, &events).await.unwrap();
+    let delivered = transfer::deliver(&tx, addr, outgoing, &events).await.unwrap();
+    rx_task.await.unwrap();
+
+    assert_eq!(delivered.totals.files, 5);
+    assert_eq!(tree_hashes(&album), tree_hashes(&dest.path().join("Album")));
+    assert!(dest.path().join("Album/empty folder").is_dir(), "empty folders arrive too");
+    assert_eq!(fs::read(dest.path().join("notes.txt")).unwrap(), b"hello");
+    let progress = progress.lock().unwrap();
+    let total = delivered.totals.bytes;
+    assert_eq!(progress.last(), Some(&(total, total)), "progress ends at the total");
+    assert!(progress.windows(2).all(|w| w[0].0 <= w[1].0), "progress only goes up: {progress:?}");
+}
+
+#[test]
+fn shared_files_with_the_same_name_are_told_apart() {
+    use glft_core::manifest::{self, Item, ItemKind};
+
+    let src = tempfile::tempdir().unwrap();
+    fs::write(src.path().join("a"), b"one").unwrap();
+    fs::write(src.path().join("b"), b"two").unwrap();
+    let files: Arc<dyn manifest::SourceFiles> = Arc::new(Opened(vec![src.path().join("a"), src.path().join("b")]));
+    let items = vec![
+        Item { name: "image.jpg".into(), kind: ItemKind::File(0) },
+        Item { name: "image.jpg".into(), kind: ItemKind::File(1) },
+    ];
+    let (m, _) = manifest::build_items(&items, files).unwrap();
+    let names: Vec<&str> = m.roots.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["image.jpg", "image (2).jpg"]);
+    m.validate().unwrap();
+}

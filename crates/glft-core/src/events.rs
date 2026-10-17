@@ -44,6 +44,8 @@ pub enum Event {
     Hashing { items: usize },
     Connecting { peer: String },
     Connected { peer: String },
+    /// The connection runs over a mesh network (Yggdrasil) rather than the local network.
+    ViaMesh { peer: String, mesh: &'static str },
     Offered { peer: String, totals: Totals },
     OfferReceived { peer: String, totals: Totals, dest: String },
     Missed { peer: String, totals: Totals },
@@ -55,6 +57,8 @@ pub enum Event {
     FileSent { path: String },
     /// Receiving: bytes verified so far in this transfer.
     Progress { done: u64, total: u64 },
+    /// Bytes sent so far; the receiver verifies them as they arrive.
+    SendProgress { done: u64, total: u64 },
     /// Receiving: an interrupted transfer continues without asking again.
     ResumingReceive { peer: String, accepted_at: i64, files_done: usize, files: usize, bytes_left: u64 },
     /// Sending: the receiver already had part of it.
@@ -65,7 +69,10 @@ pub enum Event {
     PairingWrongCode { peer: String },
     Paired { peer: String, ours: Remember, theirs: Remember },
     /// Sending: everything arrived and was verified.
-    Finished { peer: String, totals: Totals, secs: f64 },
+    /// `via` names the mesh (Yggdrasil) if that is what carried the data at the end.
+    Finished { peer: String, totals: Totals, secs: f64, via: Option<&'static str> },
+    /// The connection moved to another route while the transfer ran.
+    RouteChanged { peer: String, via: &'static str },
     /// Receiving: everything arrived and was verified.
     Received { peer: String, totals: Totals, dest: String, secs: f64 },
     Failed(Error),
@@ -93,6 +100,7 @@ impl fmt::Display for Event {
             }
             Self::Connecting { peer } => write!(f, "Connecting to {peer}"),
             Self::Connected { peer } => write!(f, "Connected to {peer}; its key matches"),
+            Self::ViaMesh { peer, mesh } => write!(f, "Reaching {peer} over {mesh}, not the local network"),
             Self::Offered { peer, totals } => write!(f, "Offered {totals} to {peer}; waiting for an answer"),
             Self::OfferReceived { peer, totals, dest } => write!(f, "{peer} offers {totals}, to be saved to {dest}"),
             Self::Missed { peer, totals } => write!(f, "Missed: {peer} stopped waiting before {totals} could be accepted"),
@@ -105,6 +113,7 @@ impl fmt::Display for Event {
             Self::FileVerified { path, saved_to } => write!(f, "{path} verified, saved to {saved_to}"),
             Self::FileSent { path } => write!(f, "{path} sent"),
             Self::Progress { done, total } => write!(f, "{} of {} verified", human_bytes(*done), human_bytes(*total)),
+            Self::SendProgress { done, total } => write!(f, "{} of {} sent", human_bytes(*done), human_bytes(*total)),
             Self::ResumingReceive { peer, accepted_at, files_done, files, bytes_left } => write!(
                 f,
                 "Resuming the transfer from {peer} you accepted at {}: {files_done} of {} already here, {} left",
@@ -140,17 +149,19 @@ impl fmt::Display for Event {
                     (_, Remember::Yes) => write!(f, ". {peer} remembers this device too"),
                 }
             }
-            Self::Finished { peer, totals, secs } => {
+            Self::Finished { peer, totals, secs, via } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
+                let over = via.map(|v| format!(" over {v}")).unwrap_or_default();
                 write!(
                     f,
-                    "{} verified with {peer} ({}, {:.1} s, {}/s)",
+                    "{} verified with {peer}{over} ({}, {:.1} s, {}/s)",
                     all_files(totals.files),
                     human_bytes(totals.bytes),
                     secs,
                     human_bytes(rate as u64)
                 )
             }
+            Self::RouteChanged { peer, via } => write!(f, "The connection to {peer} moved to {via}"),
             Self::Received { peer, totals, dest, secs } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
                 write!(

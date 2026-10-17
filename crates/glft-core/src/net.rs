@@ -76,6 +76,13 @@ pub async fn bind_ephemeral(secret: SecretKey) -> Result<Endpoint, Error> {
     build(secret, 0).await
 }
 
+/// Binds a short-lived endpoint that finds nothing by itself: no local network lookup, so it
+/// only ever dials the addresses it is given. For sending over a mesh such as Yggdrasil,
+/// where trying local addresses as well would only get in the way.
+pub async fn bind_without_discovery(secret: SecretKey) -> Result<Endpoint, Error> {
+    builder(secret, 0, ALPN).map_err(|e| bind_err(&e))?.bind().await.map_err(|e| bind_err(&e))
+}
+
 /// Binds a short-lived endpoint for pairing on any free port. It is not announced by
 /// mDNS (the code carries its addresses) and speaks only the pairing protocol.
 pub async fn bind_pairing(secret: SecretKey) -> Result<Endpoint, Error> {
@@ -136,6 +143,13 @@ pub fn lan_rank(addr: &SocketAddr) -> u8 {
 async fn build(secret: SecretKey, port: u16) -> Result<Endpoint, Error> {
     builder(secret, port, ALPN)
         .map_err(|e| bind_err(&e))?
+        // Local network announcements carry local addresses only. A device's mesh address
+        // (Yggdrasil) is learned at pairing and dialled only as a choice or a fallback.
+        .addr_filter(iroh::endpoint_info::AddrFilter::new(|addrs| {
+            std::borrow::Cow::Owned(
+                addrs.iter().filter(|a| !matches!(a, iroh::TransportAddr::Ip(ip) if mesh_name(ip).is_some())).cloned().collect(),
+            )
+        }))
         .address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE))
         .bind()
         .await
@@ -174,6 +188,16 @@ pub fn classify_unreachable(detail: &str) -> ErrorKind {
 /// Parses a device id as printed by `glft id`.
 pub fn parse_id(s: &str) -> Result<EndpointId, Error> {
     s.trim().parse().map_err(|e| Error::new(ErrorKind::BadDeviceId, format!("{s:?}: {e}")))
+}
+
+/// The mesh network an address belongs to, if any: Yggdrasil uses `200::/7`. Such an
+/// address reaches the device wherever it is, so it is kept apart from where it was last
+/// seen on a local network.
+pub fn mesh_name(addr: &SocketAddr) -> Option<&'static str> {
+    match addr.ip() {
+        std::net::IpAddr::V6(ip) if ip.octets()[0] & 0xfe == 0x02 => Some("Yggdrasil"),
+        _ => None,
+    }
 }
 
 /// Address to dial: the id plus any addresses the user typed.

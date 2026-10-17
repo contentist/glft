@@ -17,7 +17,9 @@ object Notifications {
     const val RECEIVING_CHANNEL = "receiving"
     private const val OFFER_CHANNEL = "offers"
     private const val MISSED_CHANNEL = "missed"
+    private const val SEND_CHANNEL = "sending"
     const val RECEIVING_ID = 1
+    const val SEND_ID = 2
     const val EXTRA_OFFER = "offer"
 
     fun createChannels(context: Context) {
@@ -31,6 +33,9 @@ object Notifications {
                     description = "A paired device wants to send you files"
                 },
                 NotificationChannel(MISSED_CHANNEL, "Missed offers", NotificationManager.IMPORTANCE_DEFAULT),
+                NotificationChannel(SEND_CHANNEL, "Sending", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Progress of files this phone is sending, and how it ended"
+                },
             ),
         )
     }
@@ -49,6 +54,47 @@ object Notifications {
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null, "Stop", stop).build())
             .build()
+    }
+
+    /** The send job's notification while it runs. */
+    fun sending(context: Context, s: SendState.Running): Notification {
+        val cancel = PendingIntent.getBroadcast(
+            context, 1, Intent(context, SendActionReceiver::class.java).setAction("cancel"), PendingIntent.FLAG_IMMUTABLE,
+        )
+        val pct = if (s.total > 0) (s.done * 100 / s.total).toInt() else 0
+        return Notification.Builder(context, SEND_CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setContentTitle("Sending to ${s.peer}")
+            .setContentText(if (s.done > 0) "${s.summary} · $pct%" else "${s.summary} · reading the files")
+            .setProgress(100, pct, s.done == 0L)
+            .setContentIntent(openApp(context))
+            .setOngoing(true)
+            .addAction(Notification.Action.Builder(null, "Cancel", cancel).build())
+            .build()
+    }
+
+    /** Shows a send's progress or how it ended, in the job's notification. */
+    fun update(context: Context, s: SendState) {
+        val n = when (s) {
+            is SendState.Running -> sending(context, s)
+            is SendState.Done -> Notification.Builder(context, SEND_CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_sys_upload_done)
+                .setContentTitle("Sent to ${s.peer}" + (s.via?.let { " over $it" } ?: ""))
+                .setContentText("${s.summary} · ${if (s.files == 1) "verified" else "all ${s.files} files verified"}")
+                .setContentIntent(openApp(context))
+                .setAutoCancel(true)
+                .build()
+            is SendState.Failed -> Notification.Builder(context, SEND_CHANNEL)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle(s.headline)
+                .setContentText(s.nextStep)
+                .setStyle(Notification.BigTextStyle().bigText(s.nextStep))
+                .setContentIntent(openApp(context))
+                .setAutoCancel(true)
+                .build()
+            SendState.Idle -> return
+        }
+        nm(context).notify(SEND_ID, n)
     }
 
     fun showOffer(context: Context, offer: OfferInfo) {
@@ -99,5 +145,12 @@ class OfferActionReceiver : BroadcastReceiver() {
         val id = intent.getLongExtra(Notifications.EXTRA_OFFER, -1)
         if (id < 0) return
         context.glft.node.answerOffer(id.toULong(), intent.action == "accept")
+    }
+}
+
+/** Cancel on the send notification. */
+class SendActionReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        context.glft.node.cancelSend()
     }
 }

@@ -79,7 +79,13 @@ pub enum Request {
 pub enum Reply {
     Ack { pid: u32, version: String },
     Line(LogLine),
-    Progress { done: u64, total: u64 },
+    Progress {
+        done: u64,
+        total: u64,
+        /// Sent rather than received and verified.
+        #[serde(default)]
+        sending: bool,
+    },
     Status(Status),
     Devices { devices: Vec<DeviceInfo> },
     PairCode { code: String },

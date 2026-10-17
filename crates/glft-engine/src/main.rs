@@ -199,6 +199,9 @@ impl Engine {
     }
 
     fn publish(&self, event: &Event) {
+        if let Event::Received { peer, totals, dest, .. } = event {
+            notify::received(peer, &totals.to_string(), dest);
+        }
         let reply = reply_of(event);
         if let Reply::Line(l) = &reply {
             println!("{}", l.sentence);
@@ -509,7 +512,7 @@ impl Engine {
         let (id, mut addrs, name) = {
             let store = self.devices.lock().unwrap();
             match store.find(&device) {
-                Ok(d) => (d.endpoint_id().ok_or_else(|| Error::new(ErrorKind::BadDeviceId, d.id.clone()))?, d.addrs.clone(), d.name.clone()),
+                Ok(d) => (d.endpoint_id().ok_or_else(|| Error::new(ErrorKind::BadDeviceId, d.id.clone()))?, d.dial_addrs(), d.name.clone()),
                 Err(e) => match net::parse_id(&device) {
                     Ok(id) => (id, Vec::new(), net::short_id(&id)),
                     Err(_) => return Err(e),
@@ -572,7 +575,8 @@ async fn closed(from_client: &mut mpsc::UnboundedReceiver<Request>) {
 
 fn reply_of(event: &Event) -> Reply {
     match event {
-        Event::Progress { done, total } => Reply::Progress { done: *done, total: *total },
+        Event::Progress { done, total } => Reply::Progress { done: *done, total: *total, sending: false },
+        Event::SendProgress { done, total } => Reply::Progress { done: *done, total: *total, sending: true },
         e => Reply::Line(line(e)),
     }
 }

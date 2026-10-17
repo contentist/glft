@@ -34,6 +34,10 @@ pub struct Device {
     /// Where it was last reached; tried along with local network lookup.
     #[serde(default)]
     pub addrs: Vec<SocketAddr>,
+    /// Its addresses on a mesh network (Yggdrasil), which stay the same wherever it is.
+    /// Always tried as well, and never replaced by the address that last worked.
+    #[serde(default)]
+    pub mesh_addrs: Vec<SocketAddr>,
     /// Its offers are accepted without asking.
     #[serde(default)]
     pub auto_accept: bool,
@@ -45,7 +49,25 @@ pub struct Device {
 
 impl Device {
     pub fn new(id: EndpointId, name: String, addrs: Vec<SocketAddr>) -> Self {
-        Self { id: id.to_string(), name, addrs, auto_accept: false, paired_at: now(), last_seen: None }
+        let mut device = Self { id: id.to_string(), name, addrs, mesh_addrs: Vec::new(), auto_accept: false, paired_at: now(), last_seen: None };
+        device.sort_addrs();
+        device
+    }
+
+    /// Every address worth dialling: where it was last reached, then its mesh addresses.
+    pub fn dial_addrs(&self) -> Vec<SocketAddr> {
+        self.addrs.iter().chain(&self.mesh_addrs).copied().collect()
+    }
+
+    /// Moves mesh addresses out of `addrs` (also for files from before they were kept apart).
+    fn sort_addrs(&mut self) {
+        let (mesh, other): (Vec<_>, Vec<_>) = self.addrs.iter().partition(|a| net::mesh_name(a).is_some());
+        self.addrs = other;
+        for a in mesh {
+            if !self.mesh_addrs.contains(&a) {
+                self.mesh_addrs.push(a);
+            }
+        }
     }
 
     pub fn endpoint_id(&self) -> Option<EndpointId> {
@@ -83,9 +105,11 @@ impl DeviceStore {
         let path = data_dir.join(DEVICES_FILE);
         let remembered = match fs::read(&path) {
             Ok(bytes) => {
-                serde_json::from_slice::<File>(&bytes)
+                let mut devices = serde_json::from_slice::<File>(&bytes)
                     .map_err(|e| Error::new(ErrorKind::DevicesFileDamaged, format!("{}: {e}", path.display())))?
-                    .devices
+                    .devices;
+                devices.iter_mut().for_each(Device::sort_addrs);
+                devices
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(Error::io(ErrorKind::DataDirUnwritable, &path, e)),
@@ -177,14 +201,21 @@ impl DeviceStore {
         self.update(id, |d| d.auto_accept = on)
     }
 
-    /// Records a successful contact: its current name and the address that worked.
+    /// Records a successful contact: its current name and the address that worked. Mesh
+    /// addresses are added to the ones kept, never replacing them.
     pub fn seen(&mut self, id: &EndpointId, name: Option<&str>, addrs: &[SocketAddr]) -> Result<(), Error> {
         self.update(id, |d| {
             if let Some(name) = name.filter(|n| !n.is_empty()) {
                 d.name = name.to_string();
             }
-            if !addrs.is_empty() {
-                d.addrs = addrs.to_vec();
+            let (mesh, local): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs.iter().partition(|a| net::mesh_name(a).is_some());
+            if !local.is_empty() {
+                d.addrs = local;
+            }
+            for a in mesh {
+                if !d.mesh_addrs.contains(&a) {
+                    d.mesh_addrs.push(a);
+                }
             }
             d.last_seen = Some(now());
         })
@@ -262,6 +293,24 @@ mod tests {
         let store = DeviceStore::load(dir.path()).unwrap();
         assert!(store.is_paired(&a));
         assert!(!store.is_paired(&b), "a session pairing ends with the program");
+    }
+
+    #[test]
+    fn mesh_addresses_survive_the_address_that_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DeviceStore::load(dir.path()).unwrap();
+        let id = SecretKey::generate().public();
+        let lan: SocketAddr = "192.168.1.25:47382".parse().unwrap();
+        let ygg: SocketAddr = "[201:1111:2222:3333:4444:5555:6666:7777]:47382".parse().unwrap();
+        store.pair(Device::new(id, "Laptop".into(), vec![lan, ygg]), Remember::Yes).unwrap();
+        assert_eq!(store.get(&id).unwrap().mesh_addrs, vec![ygg]);
+
+        let now_at: SocketAddr = "192.168.1.30:47382".parse().unwrap();
+        store.seen(&id, None, &[now_at]).unwrap();
+        // A transfer that ended over Yggdrasil keeps the local address too.
+        store.seen(&id, None, &[ygg]).unwrap();
+        let store = DeviceStore::load(dir.path()).unwrap();
+        assert_eq!(store.get(&id).unwrap().dial_addrs(), vec![now_at, ygg]);
     }
 
     #[test]

@@ -2,6 +2,10 @@ package io.github.contentist.glft
 
 import android.app.Application
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Environment
 import android.util.Log
@@ -14,6 +18,7 @@ import uniffi.glft_ffi.NodeListener
 import uniffi.glft_ffi.OfferInfo
 import uniffi.glft_ffi.PairedDevice
 import uniffi.glft_ffi.ReceivedInfo
+import uniffi.glft_ffi.Route
 import uniffi.glft_ffi.StorageChoice
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,6 +36,14 @@ sealed interface SaveTo {
     /** A folder picked with Android's folder picker. */
     data class Picked(val tree: Uri, override val label: String) : SaveTo
 }
+
+/** What the phone's network allows glft, as far as Android tells it. */
+data class NetState(
+    /** A VPN is the default network (Yggdrasil, WireGuard, …). */
+    val vpn: Boolean = false,
+    /** Android blocks glft from Wi-Fi: a VPN with "Block connections without VPN". */
+    val wifiBlocked: Boolean = false,
+)
 
 /**
  * Holds the one [Node] for the process, the event log and pending offers, so the
@@ -70,6 +83,108 @@ class GlftApp : Application() {
         _devices.value = node.devices()
     }
 
+    private val _sendState = MutableStateFlow<SendState>(SendState.Idle)
+    val sendState: StateFlow<SendState> = _sendState
+
+    fun setSendState(state: SendState) {
+        _sendState.value = state
+    }
+
+    /** The send chosen on screen, handed to [SendJob] in this process. */
+    class QueuedSend(val device: PairedDevice, val outgoing: Outgoing, val route: Route)
+
+    private var queuedSend: QueuedSend? = null
+
+    fun queueSend(device: PairedDevice, outgoing: Outgoing, route: Route) {
+        queuedSend = QueuedSend(device, outgoing, route)
+        _sendState.value = SendState.Running(device.name, outgoing.summary, 0, outgoing.bytes)
+    }
+
+    fun takeQueuedSend(): QueuedSend? = queuedSend.also { queuedSend = null }
+
+    private val _net = MutableStateFlow(NetState())
+    val net: StateFlow<NetState> = _net
+
+    /**
+     * Follows whether a VPN is active and whether it blocks glft from the local network, as
+     * "Block connections without VPN" does. Android doesn't report that block for Wi-Fi
+     * itself, so glft asks directly: a UDP socket "connected" to the router sends nothing,
+     * and fails with "Permission denied" when the local network is off limits. Android also
+     * blocks every network for an app sitting in the background; then the VPN is blocked
+     * too, which lockdown alone doesn't do. The core uses this to explain failures.
+     */
+    private fun watchNetwork() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        var vpn = false
+        var vpnBlocked = false
+        // The Wi-Fi router, whose reachability tells whether the local network is blocked.
+        var router: java.net.InetAddress? = null
+        fun localBlocked(): Boolean {
+            val to = router ?: return false
+            return try {
+                java.net.DatagramSocket().use { it.connect(java.net.InetSocketAddress(to, 9)) }
+                false
+            } catch (e: Exception) {
+                (e.message ?: "").contains("Permission denied") || (e.cause?.message ?: "").contains("EPERM")
+            }
+        }
+        fun publish() {
+            // In the background Android blocks glft everywhere, which hides whether the VPN
+            // blocks the local network; keep the last answer until glft can look again.
+            val blocked = when {
+                !vpn -> false
+                vpnBlocked -> _net.value.wifiBlocked
+                else -> localBlocked()
+            }
+            if (BuildConfig.DEBUG) Log.d("glft", "network: vpn=$vpn vpnBlocked=$vpnBlocked router=$router localBlocked=$blocked")
+            val now = NetState(vpn = vpn, wifiBlocked = blocked)
+            if (now != _net.value) {
+                val was = _net.value
+                _net.value = now
+                node.setNetworkState(now.vpn, now.wifiBlocked)
+                if (now.wifiBlocked && !was.wifiBlocked) {
+                    note("A VPN is blocking the local network (Block connections without VPN); glft can only use a mesh such as Yggdrasil")
+                } else if (!now.wifiBlocked && was.wifiBlocked) {
+                    note("The local network is reachable again")
+                }
+            }
+        }
+        recheckNetwork = { publish() }
+        cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                vpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                publish()
+            }
+
+            override fun onBlockedStatusChanged(network: Network, isBlocked: Boolean) {
+                vpnBlocked = isBlocked
+                publish()
+            }
+
+            override fun onLost(network: Network) {
+                vpn = false
+                vpnBlocked = false
+                publish()
+            }
+        })
+        val wifi = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
+        cm.registerNetworkCallback(wifi, object : ConnectivityManager.NetworkCallback() {
+            override fun onLinkPropertiesChanged(network: Network, lp: android.net.LinkProperties) {
+                router = lp.routes.firstOrNull { it.hasGateway() && it.gateway is java.net.Inet4Address }?.gateway
+                publish()
+            }
+
+            override fun onLost(network: Network) {
+                router = null
+                publish()
+            }
+        })
+    }
+
+    /** Checks the network again, e.g. when glft comes back on screen. */
+    var recheckNetwork: () -> Unit = {}
+        private set
+
     override fun onCreate() {
         super.onCreate()
         Notifications.createChannels(this)
@@ -78,6 +193,7 @@ class GlftApp : Application() {
         val label = prefs.getString("treeLabel", null)
         if (tree != null && label != null) _saveTo.value = SaveTo.Picked(Uri.parse(tree), label)
         _received.value = loadReceived()
+        watchNetwork()
     }
 
     private val receivedFile get() = File(filesDir, "received.json")
@@ -169,6 +285,10 @@ class GlftApp : Application() {
 
         override fun onProgress(done: ULong, total: ULong) {
             _progress.value = if (done >= total) null else done to total
+        }
+
+        override fun onSendProgress(done: ULong, total: ULong) {
+            _sendState.update { s -> if (s is SendState.Running) s.copy(done = done.toLong(), total = total.toLong()) else s }
         }
 
         override fun onReceived(received: ReceivedInfo) {

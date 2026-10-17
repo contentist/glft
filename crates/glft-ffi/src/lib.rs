@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,7 +22,9 @@ use glft_core::{
     Error, Event, ErrorKind,
     devices::{Device, DeviceStore, Remember},
     events::EventSink,
-    identity, net,
+    identity,
+    manifest::{Item, ItemKind, SourceFiles},
+    net,
     pairing::{self, PairingCode},
     resume::Records,
     storage::{FsStorage, Partial, ReceiveStorage},
@@ -163,6 +165,59 @@ pub trait NodeListener: Send + Sync {
     fn on_progress(&self, done: u64, total: u64);
     /// A transfer arrived complete, every file verified.
     fn on_received(&self, received: ReceivedInfo);
+    /// Bytes sent so far in the transfer this phone is sending.
+    fn on_send_progress(&self, done: u64, total: u64);
+}
+
+/// Files chosen to send, opened by Kotlin when Rust needs them (each time, so thousands of
+/// files never hold thousands of descriptors).
+#[uniffi::export(with_foreign)]
+pub trait SendSource: Send + Sync {
+    /// Opens file `index` for reading and returns an owned, detached file descriptor
+    /// (`ParcelFileDescriptor.detachFd()`); Rust closes it.
+    fn open(&self, index: u32) -> Result<i32, StorageError>;
+}
+
+/// Something chosen to send: one file (`file` set), or a folder and everything below it.
+#[derive(uniffi::Record)]
+pub struct SendItem {
+    pub name: String,
+    /// The [`SendSource`] index, for a single file.
+    pub file: Option<u32>,
+    /// For a folder: what's below it.
+    pub entries: Vec<FolderEntry>,
+}
+
+/// A file or folder below a folder being sent.
+#[derive(uniffi::Record)]
+pub struct FolderEntry {
+    /// Relative to the folder, `/`-separated.
+    pub rel: String,
+    /// The [`SendSource`] index for a file; `None` for a folder.
+    pub file: Option<u32>,
+}
+
+/// Which way to reach the other device.
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// The local network, with the mesh as a fallback if it doesn't answer.
+    Auto,
+    /// The local network only.
+    Local,
+    /// The mesh (Yggdrasil) only, never touching the local network.
+    Mesh,
+}
+
+/// A finished send.
+#[derive(uniffi::Record)]
+pub struct SendResult {
+    pub peer: String,
+    pub summary: String,
+    pub files: u32,
+    pub secs: f64,
+    /// The mesh ("Yggdrasil") if that is what carried the data at the end; `None` for the
+    /// local network.
+    pub via: Option<String>,
 }
 
 /// A finished incoming transfer, for the Received list.
@@ -219,9 +274,21 @@ pub struct PairedDevice {
     /// False for a "just this time" pairing, which ends when receiving is switched off.
     pub remembered: bool,
     pub last_seen_unix: Option<i64>,
+    /// The mesh it can also be reached over ("Yggdrasil"), if glft knows its address there.
+    pub mesh: Option<String>,
 }
 
 // ---------------------------------------------------------------- storage adapters
+
+struct ForeignSource(Arc<dyn SendSource>);
+
+impl SourceFiles for ForeignSource {
+    fn open(&self, index: usize) -> io::Result<File> {
+        let fd = self.0.open(index as u32)?;
+        // SAFETY: the Kotlin side detached this descriptor and hands its ownership to us.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+}
 
 struct ForeignStorage(Arc<dyn StorageBackend>);
 
@@ -343,6 +410,8 @@ pub struct Node {
     running: Mutex<Option<Running>>,
     starting: Mutex<()>,
     pairing: Mutex<Option<pairing::Pending>>,
+    /// Stops the send in progress.
+    cancel_send: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 #[uniffi::export]
@@ -366,6 +435,7 @@ impl Node {
             running: Mutex::new(None),
             starting: Mutex::new(()),
             pairing: Mutex::new(None),
+            cancel_send: Mutex::new(None),
         }))
     }
 
@@ -469,7 +539,10 @@ impl Node {
             .unwrap()
             .list()
             .into_iter()
-            .map(|(d, remembered)| PairedDevice { id: d.id, name: d.name, auto_accept: d.auto_accept, remembered, last_seen_unix: d.last_seen })
+            .map(|(d, remembered)| {
+                let mesh = d.mesh_addrs.iter().find_map(net::mesh_name).map(String::from);
+                PairedDevice { id: d.id, name: d.name, auto_accept: d.auto_accept, remembered, last_seen_unix: d.last_seen, mesh }
+            })
             .collect()
     }
 
@@ -483,6 +556,87 @@ impl Node {
         let id = net::parse_id(&id)?;
         self.devices.lock().unwrap().set_auto_accept(&id, on)?;
         Ok(())
+    }
+
+    /// Sends `items` to the paired device `device_id` and blocks until every file is
+    /// verified there, the send fails, or [`Node::cancel_send`] is called. A lost
+    /// connection is retried. Run it from a background job.
+    pub fn send(&self, device_id: String, items: Vec<SendItem>, source: Arc<dyn SendSource>, route: Route, listener: Arc<dyn NodeListener>) -> Result<SendResult, GlftError> {
+        let id = net::parse_id(&device_id)?;
+        let device = self
+            .devices
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::new(ErrorKind::UnknownDevice, device_id.clone()))?;
+        let items: Vec<Item> = items
+            .into_iter()
+            .map(|i| Item {
+                name: i.name,
+                kind: match i.file {
+                    Some(f) => ItemKind::File(f as usize),
+                    None => ItemKind::Folder(i.entries.into_iter().map(|e| (e.rel, e.file.map(|f| f as usize))).collect()),
+                },
+            })
+            .collect();
+        let events = sink(listener);
+        let (cancel, cancelled) = oneshot::channel();
+        *self.cancel_send.lock().unwrap() = Some(cancel);
+        let addrs = match route {
+            Route::Auto => device.dial_addrs(),
+            Route::Local => device.addrs.clone(),
+            Route::Mesh => device.mesh_addrs.clone(),
+        };
+        if addrs.is_empty() && route == Route::Mesh {
+            return Err(Error::new(ErrorKind::PeerUnreachable, format!("glft knows no mesh address for {}", device.name)).into());
+        }
+        // Send from the receiving endpoint if there is one, so the other side sees the
+        // same address; otherwise from a short-lived one with the same key. Over the mesh,
+        // always a separate one that never looks at the local network.
+        let receiving = self.running.lock().unwrap().as_ref().map(|r| r.endpoint.clone());
+        let secret = self.secret.clone();
+        let peer = net::peer_addr(id, &addrs);
+        let files: Arc<dyn SourceFiles> = Arc::new(ForeignSource(source));
+        let result = runtime().block_on(async move {
+            let (endpoint, temporary) = match (route, receiving) {
+                (Route::Mesh, _) => (net::bind_without_discovery(secret).await?, true),
+                (_, Some(ep)) => (ep, false),
+                (_, None) => (net::bind_ephemeral(secret).await?, true),
+            };
+            let result = tokio::select! {
+                r = transfer::send_items(&endpoint, peer, items, files, &events) => r,
+                _ = cancelled => Err(Error::new(ErrorKind::Cancelled, "the send was cancelled")),
+            };
+            if temporary {
+                endpoint.close().await;
+            }
+            result
+        });
+        *self.cancel_send.lock().unwrap() = None;
+        match result {
+            Ok(delivered) => {
+                let _ = self.devices.lock().unwrap().seen(&id, None, delivered.addr.as_slice());
+                Ok(SendResult { peer: device.name, summary: delivered.totals.to_string(), files: delivered.totals.files as u32, secs: delivered.secs, via: delivered.via.map(String::from) })
+            }
+            Err(e) => Err(explain_network(e).into()),
+        }
+    }
+
+    /// Stops the send in progress, if any. What already arrived is kept, and sending the
+    /// same files again continues from there.
+    pub fn cancel_send(&self) {
+        if let Some(cancel) = self.cancel_send.lock().unwrap().take() {
+            let _ = cancel.send(());
+        }
+    }
+
+    /// What the phone knows about its network, so failures can be explained: whether a
+    /// VPN is active, and whether Android blocks this app from the local network (as
+    /// "Block connections without VPN" does).
+    pub fn set_network_state(&self, vpn_active: bool, lan_blocked: bool) {
+        VPN_ACTIVE.store(vpn_active, Ordering::Relaxed);
+        LAN_BLOCKED.store(lan_blocked, Ordering::Relaxed);
     }
 
     /// Times the storage path the way a real transfer uses it: `files` files of `size`
@@ -570,11 +724,28 @@ impl Drop for OfferGuard {
     }
 }
 
+static VPN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static LAN_BLOCKED: AtomicBool = AtomicBool::new(false);
+
+/// A VPN in lockdown makes the local network look unreachable; say so instead.
+fn explain_network(e: Error) -> Error {
+    let unreachable = matches!(e.kind, ErrorKind::PeerUnreachable | ErrorKind::LocalNetworkBlocked | ErrorKind::ConnectionLost);
+    if unreachable && VPN_ACTIVE.load(Ordering::Relaxed) && LAN_BLOCKED.load(Ordering::Relaxed) {
+        Error::new(ErrorKind::VpnLockdown, format!("{} ({})", e.detail, e.kind.id()))
+    } else {
+        e
+    }
+}
+
 fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
     Arc::new(move |event: Event| {
         let at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
         if let Event::Progress { done, total } = event {
             listener.on_progress(done, total);
+            return;
+        }
+        if let Event::SendProgress { done, total } = event {
+            listener.on_send_progress(done, total);
             return;
         }
         if let Event::Received { peer, totals, dest, .. } = &event {
@@ -592,6 +763,9 @@ fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
         };
         let sentence = match &event {
             Event::Failed(e) => e.kind.headline().to_string(),
+            Event::ViaMesh { mesh, .. } if LAN_BLOCKED.load(Ordering::Relaxed) => {
+                format!("The local network is blocked by a VPN (lockdown); sending over {mesh} instead")
+            }
             _ => event.to_string(),
         };
         listener.on_log(LogLine { at_unix_ms, sentence, is_error, next_step, detail });

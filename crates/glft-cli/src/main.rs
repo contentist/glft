@@ -436,7 +436,7 @@ impl Session {
             match self.conn.recv::<Reply>().await.map_err(lost_engine)? {
                 None => return Err(lost_engine("the connection closed")),
                 Some(Reply::Line(l)) => out().log(&l),
-                Some(Reply::Progress { done, total }) => out().progress(done, total),
+                Some(Reply::Progress { done, total, sending }) => out().progress(done, total, sending),
                 Some(Reply::Done) => {
                     out().clear();
                     return Ok(None);
@@ -606,12 +606,13 @@ impl Out {
         }
     }
 
-    fn progress(&self, done: u64, total: u64) {
+    fn progress(&self, done: u64, total: u64, sending: bool) {
         if !self.tty {
             return;
         }
         let pct = (done * 100).checked_div(total).unwrap_or(100);
-        print!("\r\x1b[2K{:>10}  {} of {} verified ({pct}%)", "", human_bytes(done), human_bytes(total));
+        let what = if sending { "sent" } else { "verified" };
+        print!("\r\x1b[2K{:>10}  {} of {} {what} ({pct}%)", "", human_bytes(done), human_bytes(total));
         let _ = std::io::stdout().flush();
         PROGRESS_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
     }

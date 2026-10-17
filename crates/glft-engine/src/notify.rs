@@ -107,3 +107,17 @@ pub fn offer(engine: Arc<Engine>, offer: OfferInfo) -> Option<Notice> {
         _ => false,
     }))
 }
+
+/// "Received from Pixel 8 Pro": shown once when a transfer arrives complete, so files
+/// accepted without asking don't arrive unnoticed.
+pub fn received(peer: &str, summary: &str, dest: &str) {
+    let mut n = Notification::new();
+    n.appname("glft")
+        .summary(&format!("Received from {peer}"))
+        .body(&format!("{summary}, every file verified, in {dest}"))
+        .icon("document-save")
+        .timeout(Timeout::Default);
+    tokio::spawn(async move {
+        let _ = n.show_async().await;
+    });
+}

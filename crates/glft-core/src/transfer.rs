@@ -51,6 +51,8 @@ use crate::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long the local network gets on its own before mesh addresses are tried as well.
+const LOCAL_FIRST: Duration = Duration::from_secs(4);
 /// Verified data is gathered into writes of this size.
 const WRITE_BUFFER: usize = 4 * 1024 * 1024;
 /// Files fetched at the same time.
@@ -84,6 +86,27 @@ pub async fn prepare(paths: Vec<PathBuf>, events: &EventSink) -> Result<Arc<Outg
     Ok(Arc::new(Outgoing { manifest, sources }))
 }
 
+/// Like [`prepare`], for items chosen on a device without paths (the phone).
+pub async fn prepare_items(items: Vec<manifest::Item>, files: Arc<dyn manifest::SourceFiles>, events: &EventSink) -> Result<Arc<Outgoing>, Error> {
+    events(Event::Hashing { items: items.len() });
+    let (manifest, sources) = tokio::task::spawn_blocking(move || manifest::build_items(&items, files))
+        .await
+        .map_err(|e| Error::new(ErrorKind::SourceUnreadable, e.to_string()))??;
+    Ok(Arc::new(Outgoing { manifest, sources }))
+}
+
+/// Sends items chosen on a device without paths (the phone) to `peer`.
+pub async fn send_items(
+    endpoint: &Endpoint,
+    peer: EndpointAddr,
+    items: Vec<manifest::Item>,
+    files: Arc<dyn manifest::SourceFiles>,
+    events: &EventSink,
+) -> Result<Delivered, Error> {
+    let outgoing = prepare_items(items, files, events).await?;
+    deliver(endpoint, peer, outgoing, events).await
+}
+
 /// Sends `paths` to `peer` and returns what was delivered.
 pub async fn send(endpoint: &Endpoint, peer: EndpointAddr, paths: Vec<PathBuf>, events: &EventSink) -> Result<Delivered, Error> {
     let outgoing = prepare(paths, events).await?;
@@ -101,6 +124,38 @@ pub struct Delivered {
     pub totals: Totals,
     /// The receiver's address the transfer ended on, worth trying first next time.
     pub addr: Option<SocketAddr>,
+    /// Seconds from acceptance to the last file verified.
+    pub secs: f64,
+    /// The mesh (Yggdrasil) if that is what carried the data at the end; `None` for the
+    /// local network.
+    pub via: Option<&'static str>,
+}
+
+/// What the local network is called in route sentences.
+const LOCAL_NETWORK: &str = "the local network";
+
+/// The route a connection is using now: a mesh's name, or [`LOCAL_NETWORK`].
+fn route_of(paths: iroh::endpoint::PathList<'_>) -> Option<&'static str> {
+    paths.into_iter().find(|p| p.is_selected()).and_then(|p| match p.remote_addr() {
+        TransportAddr::Ip(addr) => Some(net::mesh_name(addr).unwrap_or(LOCAL_NETWORK)),
+        _ => None,
+    })
+}
+
+/// Follows a connection's route, says when it changes, and keeps the latest in `route`.
+/// iroh moves a connection to a better route by itself (from Yggdrasil to Wi-Fi when both
+/// devices turn out to share one), so where it started is not where the data went.
+fn watch_route(conn: Connection, peer: String, route: Arc<Mutex<Option<&'static str>>>, events: EventSink) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut paths = conn.paths_stream();
+        while let Some(list) = paths.next().await {
+            let Some(now) = route_of(list) else { continue };
+            let before = route.lock().unwrap().replace(now);
+            if before.is_some_and(|b| b != now) {
+                events(Event::RouteChanged { peer: peer.clone(), via: now });
+            }
+        }
+    })
 }
 
 /// Delivers prepared files. Before the receiver has accepted, any failure ends it. Once
@@ -118,7 +173,10 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, outgoing: Arc<
         connected: false,
         reached: reached.clone(),
         addr: None,
+        via_mesh: None,
+        route: Arc::new(Mutex::new(None)),
         sent: Arc::new(Mutex::new(HashSet::new())),
+        progress: Arc::new(SendProgress::new(totals.bytes, events.clone())),
         started: Instant::now(),
     };
     let mut backoff = Duration::from_secs(1);
@@ -155,8 +213,11 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, outgoing: Arc<
         };
         match result {
             Ok(()) => {
-                events(Event::Finished { peer: s.label, totals, secs: s.started.elapsed().as_secs_f64() });
-                return Ok(Delivered { totals, addr: s.addr });
+                s.progress.set(totals.bytes);
+                let secs = s.started.elapsed().as_secs_f64();
+                let via = (*s.route.lock().unwrap()).filter(|r| *r != LOCAL_NETWORK);
+                events(Event::Finished { peer: s.label, totals, secs, via });
+                return Ok(Delivered { totals, addr: s.addr, secs, via });
             }
             Err(e) if s.accepted && retryable(e.kind) => {
                 tracing::debug!(peer = %s.label, kind = e.kind.id(), detail = %e.detail, ?backoff, "attempt failed; retrying");
@@ -187,7 +248,7 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, outgoing: Arc<
 /// reconnect, and each one dialled takes a share of the connection attempts, so a phone
 /// back on Wi-Fi was otherwise tried on its new address only after many tries at stale
 /// ones. Its private IPv4 addresses are preferred, as the ones this network can reach
-/// (mobile data addresses are announced too).
+/// (mobile data addresses are announced too), and its mesh addresses are kept.
 async fn new_addrs(endpoint: &Endpoint, peer: &EndpointAddr) -> EndpointAddr {
     let Ok(lookup) = endpoint.address_lookup() else { return std::future::pending().await };
     let known: HashSet<SocketAddr> = peer.ip_addrs().copied().collect();
@@ -200,6 +261,10 @@ async fn new_addrs(endpoint: &Endpoint, peer: &EndpointAddr) -> EndpointAddr {
             let lan: Vec<SocketAddr> = announced.iter().filter(|a| net::lan_rank(a) < 3).copied().collect();
             let dial = if lan.is_empty() { announced } else { lan };
             if dial.iter().any(|a| !known.contains(a)) {
+                // Mesh addresses stay: they work wherever the device is, and are the way
+                // round a VPN that blocks the local network.
+                let mesh = peer.ip_addrs().filter(|a| net::mesh_name(a).is_some()).copied();
+                let dial: Vec<SocketAddr> = dial.into_iter().chain(mesh).collect();
                 return net::peer_addr(peer.id, &dial);
             }
         }
@@ -217,8 +282,13 @@ struct SendState {
     reached: Arc<AtomicBool>,
     /// The receiver's address in use when the transfer finished.
     addr: Option<SocketAddr>,
+    /// The mesh network the last connection went over, said once in the log.
+    via_mesh: Option<&'static str>,
+    /// The route the current connection is using, kept up to date by [`watch_route`].
+    route: Arc<Mutex<Option<&'static str>>>,
     /// Files the receiver has confirmed, across attempts.
     sent: Arc<Mutex<HashSet<u32>>>,
+    progress: Arc<SendProgress>,
     /// When the receiver first accepted.
     started: Instant,
 }
@@ -229,14 +299,46 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
         events(Event::Connecting { peer: s.label.clone() });
     }
     let dialled_lan = peer.ip_addrs().copied().filter(|a| net::lan_rank(a) < 3).min_by_key(net::lan_rank);
-    let conn = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(peer, ALPN))
-        .await
-        .map_err(|_| Error::new(ErrorKind::PeerUnreachable, "no answer within 15 seconds"))?
-        .map_err(|e| Error::new(net::classify_unreachable(&e.to_string()), e.to_string()))?;
+    // The local network first: a mesh such as Yggdrasil is the way round a VPN that blocks
+    // it, not the first choice. Mesh addresses join after a few seconds, or at once if the
+    // local network refuses (as a VPN in lockdown makes it).
+    let (mesh, local): (Vec<SocketAddr>, Vec<SocketAddr>) = peer.ip_addrs().partition(|a| net::mesh_name(a).is_some());
+    let local_first = if mesh.is_empty() || local.is_empty() {
+        None
+    } else {
+        match tokio::time::timeout(LOCAL_FIRST, endpoint.connect(net::peer_addr(peer.id, &local), ALPN)).await {
+            Ok(Ok(conn)) => Some(conn),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "local network refused; trying mesh addresses too");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("no answer on the local network yet; trying mesh addresses too");
+                None
+            }
+        }
+    };
+    let conn = match local_first {
+        Some(conn) => conn,
+        None => tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(peer, ALPN))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PeerUnreachable, "no answer within 15 seconds"))?
+            .map_err(|e| Error::new(net::classify_unreachable(&e.to_string()), e.to_string()))?,
+    };
     s.reached.store(true, Ordering::Relaxed);
     if !s.accepted {
         events(Event::Connected { peer: s.label.clone() });
     }
+    let start = route_of(conn.paths());
+    let mesh = start.filter(|r| *r != LOCAL_NETWORK);
+    if mesh != s.via_mesh {
+        if let Some(mesh) = mesh {
+            events(Event::ViaMesh { peer: s.label.clone(), mesh });
+        }
+        s.via_mesh = mesh;
+    }
+    *s.route.lock().unwrap() = start;
+    let route_watch = AbortOnDrop(watch_route(conn.clone(), s.label.clone(), s.route.clone(), events.clone()));
 
     // A receiver that does not know this device closes the connection straight away.
     let label = s.label.clone();
@@ -269,13 +371,14 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
         Answer::Accept { device_name, resumed } => {
             s.label = format!("\"{device_name}\"");
             match resumed {
-                Some(Resumed { files_done, bytes_left }) => events(Event::ResumingSend {
-                    peer: s.label.clone(),
-                    files_done: files_done as usize,
-                    files: totals.files,
-                    bytes_left,
-                }),
-                None => events(Event::Accepted { peer: s.label.clone() }),
+                Some(Resumed { files_done, bytes_left }) => {
+                    events(Event::ResumingSend { peer: s.label.clone(), files_done: files_done as usize, files: totals.files, bytes_left });
+                    s.progress.set(totals.bytes.saturating_sub(bytes_left));
+                }
+                None => {
+                    events(Event::Accepted { peer: s.label.clone() });
+                    s.progress.set(0);
+                }
             }
             if !s.accepted {
                 // Time the transfer, not the person deciding.
@@ -285,9 +388,10 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
         }
     }
 
-    let server = tokio::spawn(serve_requests(conn.clone(), outgoing.clone(), s.sent.clone(), events.clone()));
+    let server = tokio::spawn(serve_requests(conn.clone(), outgoing.clone(), s.sent.clone(), s.progress.clone(), events.clone()));
     let done = proto::read::<Done>(&mut ctl_recv).await;
     server.abort();
+    drop(route_watch);
     // Remember a private IPv4 address if the connection had one, or else the one dialled
     // (the connection may have moved to IPv6 by now): a phone's IPv6 addresses change
     // with every Wi-Fi reconnect, while its IPv4 lease often survives.
@@ -316,11 +420,11 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
 }
 
 /// Answers file requests until the connection closes.
-async fn serve_requests(conn: Connection, outgoing: Arc<Outgoing>, sent: Arc<Mutex<HashSet<u32>>>, events: EventSink) {
+async fn serve_requests(conn: Connection, outgoing: Arc<Outgoing>, sent: Arc<Mutex<HashSet<u32>>>, progress: Arc<SendProgress>, events: EventSink) {
     while let Ok((send, recv)) = conn.accept_bi().await {
-        let (outgoing, sent, events) = (outgoing.clone(), sent.clone(), events.clone());
+        let (outgoing, sent, progress, events) = (outgoing.clone(), sent.clone(), progress.clone(), events.clone());
         tokio::spawn(async move {
-            match serve_file(send, recv, &outgoing, &events).await {
+            match serve_file(send, recv, &outgoing, &progress, &events).await {
                 Ok(index) => {
                     sent.lock().unwrap().insert(index);
                 }
@@ -332,7 +436,7 @@ async fn serve_requests(conn: Connection, outgoing: Arc<Outgoing>, sent: Arc<Mut
     }
 }
 
-async fn serve_file(mut send: SendStream, mut recv: RecvStream, outgoing: &Outgoing, events: &EventSink) -> Result<u32, Error> {
+async fn serve_file(mut send: SendStream, mut recv: RecvStream, outgoing: &Outgoing, progress: &SendProgress, events: &EventSink) -> Result<u32, Error> {
     let req: FileRequest = proto::read(&mut recv).await?;
     let (entry, source) = outgoing
         .manifest
@@ -340,23 +444,92 @@ async fn serve_file(mut send: SendStream, mut recv: RecvStream, outgoing: &Outgo
         .get(req.index as usize)
         .zip(outgoing.sources.get(req.index as usize))
         .ok_or_else(|| Error::new(ErrorKind::ProtocolError, format!("request for file {}", req.index)))?;
-    let path = source.path.clone();
-    let file = iroh_io::File::open(path.clone())
+    let what = source.file.describe();
+    let opener = source.file.clone();
+    let file = tokio::task::spawn_blocking(move || opener.open())
         .await
-        .map_err(|e| Error::io(ErrorKind::SourceUnreadable, &path, e))?;
+        .map_err(|e| Error::new(ErrorKind::SourceUnreadable, e.to_string()))?
+        .map_err(|e| Error::new(ErrorKind::SourceUnreadable, format!("{what}: {e}")))?;
+    let file = iroh_io::File::from_std(file);
     let outboard = PreOrderMemOutboard { root: source.outboard.root, tree: source.outboard.tree, data: &source.outboard.data[..] };
     let ranges = ChunkRanges::from(ChunkNum(req.from_chunk)..);
-    encode_ranges_validated(file, outboard, &ranges, TokioStreamWriter(&mut send))
+    encode_ranges_validated(file, outboard, &ranges, TokioStreamWriter(Counted { inner: &mut send, progress }))
         .await
         .map_err(|e| match e {
             bao_tree::io::EncodeError::Io(e) if e.kind() != std::io::ErrorKind::InvalidData => lost(e),
-            e => Error::new(ErrorKind::VerificationFailed, format!("{}: changed while being sent ({e})", path.display())),
+            e => Error::new(ErrorKind::VerificationFailed, format!("{}: changed while being sent ({e})", entry.path)),
         })?;
     send.finish().map_err(lost)?;
     // Wait until the receiver has everything before reporting it sent.
     send.stopped().await.map_err(lost)?;
     events(Event::FileSent { path: entry.path.clone() });
     Ok(req.index)
+}
+
+/// Aborts a task when dropped, so it ends with the attempt however that ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Bytes on their way to the receiver, reported at most a few times a second.
+struct SendProgress {
+    done: AtomicU64,
+    total: u64,
+    last: Mutex<Option<Instant>>,
+    events: EventSink,
+}
+
+impl SendProgress {
+    fn new(total: u64, events: EventSink) -> Self {
+        Self { done: AtomicU64::new(0), total, last: Mutex::new(None), events }
+    }
+
+    /// Starts counting from what the receiver already has, and reports it.
+    fn set(&self, done: u64) {
+        self.done.store(done, Ordering::Relaxed);
+        *self.last.lock().unwrap() = Some(Instant::now());
+        (self.events)(Event::SendProgress { done: done.min(self.total), total: self.total });
+    }
+
+    fn add(&self, n: u64) {
+        let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
+        let mut last = self.last.lock().unwrap();
+        if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+            *last = Some(Instant::now());
+            drop(last);
+            // What goes out includes the fingerprints that let the receiver check each
+            // piece (about 0.4%), so the count can pass the total just before the end.
+            (self.events)(Event::SendProgress { done: done.min(self.total), total: self.total });
+        }
+    }
+}
+
+/// Counts what is written through it.
+struct Counted<'a, W> {
+    inner: W,
+    progress: &'a SendProgress,
+}
+
+impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counted<'_, W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &polled {
+            self.progress.add(*n as u64);
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 // ---------------------------------------------------------------- receiving

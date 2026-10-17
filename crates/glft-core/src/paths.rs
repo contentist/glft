@@ -38,10 +38,16 @@ pub fn set_device_name(name: String) {
     let _ = DEVICE_NAME.set(name);
 }
 
+/// Overrides the name shown to other devices.
+pub const DEVICE_NAME_ENV: &str = "GLFT_DEVICE_NAME";
+
 /// This device's name as shown to the other side.
 pub fn device_name() -> String {
     if let Some(name) = DEVICE_NAME.get() {
         return name.clone();
+    }
+    if let Some(name) = std::env::var(DEVICE_NAME_ENV).ok().filter(|n| !n.trim().is_empty()) {
+        return name.trim().to_string();
     }
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()

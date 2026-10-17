@@ -31,6 +31,14 @@ class MediaStoreStorage(private val resolver: ContentResolver) : StorageBackend 
             count("${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?", arrayOf("$BASE/$rel/%")) > 0
     }
 
+    // Pending entries carry their final name in the media store, so they must not count
+    // here: only a file that is on disk under its name and no longer pending.
+    override fun published(rel: String): Boolean = guard {
+        val (dir, name) = split(rel)
+        File(downloads, "$FOLDER/$rel").isFile ||
+            count("${MediaStore.MediaColumns.RELATIVE_PATH}=? AND ${MediaStore.MediaColumns.DISPLAY_NAME}=? AND ${MediaStore.MediaColumns.IS_PENDING}=0", arrayOf(dir, name)) > 0
+    }
+
     // The media store creates folders as files are inserted; making them here keeps
     // empty folders, where the platform allows it.
     override fun makeDir(rel: String) = guard {
@@ -49,6 +57,11 @@ class MediaStoreStorage(private val resolver: ContentResolver) : StorageBackend 
         val uri = resolver.insert(collection, values) ?: throw IllegalStateException("media store refused $rel")
         val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw IllegalStateException("could not open $uri")
         OpenedPartial(pfd.detachFd(), uri.toString())
+    }
+
+    // A pending entry survives the app being killed; it is ours, so it can be opened again.
+    override fun reopenPartial(rel: String, token: String): OpenedPartial? = guard {
+        reopen(resolver, Uri.parse(token))?.let { OpenedPartial(it, token) }
     }
 
     override fun finish(rel: String, token: String) = guard {
@@ -93,6 +106,17 @@ class MediaStoreStorage(private val resolver: ContentResolver) : StorageBackend 
 fun mimeType(name: String): String =
     MimeTypeMap.getSingleton().getMimeTypeFromExtension(name.substringAfterLast('.', "").lowercase())
         ?: "application/octet-stream"
+
+/** Opens a document or media entry for writing without truncating it, or null if it is gone. */
+fun reopen(resolver: ContentResolver, uri: Uri): Int? = try {
+    resolver.openFileDescriptor(uri, "rw")?.detachFd()
+} catch (e: java.io.FileNotFoundException) {
+    null
+} catch (e: IllegalArgumentException) {
+    null
+} catch (e: SecurityException) {
+    null
+}
 
 /** Runs a storage call, turning any failure into the error Rust understands. */
 inline fun <T> guard(block: () -> T): T = try {

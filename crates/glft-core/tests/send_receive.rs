@@ -12,6 +12,8 @@ use glft_core::{
     events::EventSink,
     net,
     storage::FsStorage,
+    resume::Records,
+    storage::VERIFIED_XATTR,
     transfer::{self, Authorize, Decide, ReceiveOptions},
 };
 use iroh::SecretKey;
@@ -93,9 +95,10 @@ async fn receiver_with(
     let port = ep.bound_sockets()[0].port();
     let addr = net::peer_addr(ep.id(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
     let storage = Arc::new(FsStorage::new(dest.to_path_buf()).unwrap());
-    let opts = ReceiveOptions { storage, decide, authorize, once: true };
+    let state = tempfile::tempdir().unwrap().keep();
+    let opts = Arc::new(ReceiveOptions { storage, decide, authorize, records: Records::new(&state), seen: None, once: true });
     let ep2 = ep.clone();
-    let task = tokio::spawn(async move { transfer::serve(&ep2, &opts, &events).await.unwrap() });
+    let task = tokio::spawn(async move { transfer::serve(&ep2, opts, &events).await.unwrap() });
     (ep, addr, task, log)
 }
 
@@ -111,10 +114,12 @@ async fn folder_arrives_verified_with_structure() {
     let (_rx_ep, addr, rx_task, rx_log) = receiver(dest.path(), answer(true)).await;
     let (events, tx_log) = collecting();
     let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
-    let totals = transfer::send(&tx, addr, vec![album.clone(), src.path().join("notes.txt")], &events).await.unwrap();
+    let delivered = transfer::send(&tx, addr.clone(), vec![album.clone(), src.path().join("notes.txt")], &events).await.unwrap();
     rx_task.await.unwrap();
 
-    assert_eq!(totals.files, 5);
+    assert_eq!(delivered.totals.files, 5);
+    let used = delivered.addr.expect("the address the transfer used");
+    assert!(addr.ip_addrs().any(|a| a.port() == used.port()), "{used} is one of the receiver's addresses");
     assert_eq!(tree_hashes(&album), tree_hashes(&dest.path().join("Album (2)")));
     assert_eq!(fs::read(dest.path().join("notes.txt")).unwrap(), b"hello");
     let leftovers: Vec<_> = walkdir(dest.path()).into_iter().filter(|p| p.to_string_lossy().ends_with(".glft-part")).collect();
@@ -123,7 +128,10 @@ async fn folder_arrives_verified_with_structure() {
     let rx_log = rx_log.lock().unwrap().join("\n");
     assert!(rx_log.contains("offers 1 folder, 5 files"), "{rx_log}");
     assert!(rx_log.contains("\"Album\" already exists here; saving as \"Album (2)\""), "{rx_log}");
-    assert!(rx_log.contains("All 5 files verified"), "{rx_log}");
+    assert!(rx_log.contains("All 5 files from"), "{rx_log}");
+    let mark = xattr::get(dest.path().join("Album (2)/Disc 1/track01.flac"), VERIFIED_XATTR).unwrap().unwrap();
+    let expected = blake3::hash(&fs::read(album.join("Disc 1/track01.flac")).unwrap()).to_hex().to_string();
+    assert_eq!(String::from_utf8(mark).unwrap(), expected, "received files carry their fingerprint");
     let tx_log = tx_log.lock().unwrap().join("\n");
     assert!(tx_log.contains("All 5 files verified"), "{tx_log}");
 }

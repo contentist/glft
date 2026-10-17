@@ -28,8 +28,15 @@ pub struct Offer {
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Answer {
-    Accept { device_name: String },
+    /// `resumed` is set when the receiver continues an earlier, interrupted transfer.
+    Accept { device_name: String, resumed: Option<Resumed> },
     Decline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resumed {
+    pub files_done: u32,
+    pub bytes_left: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

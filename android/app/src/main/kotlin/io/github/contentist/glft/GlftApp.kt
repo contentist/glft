@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -11,7 +12,11 @@ import uniffi.glft_ffi.LogLine
 import uniffi.glft_ffi.Node
 import uniffi.glft_ffi.NodeListener
 import uniffi.glft_ffi.OfferInfo
+import uniffi.glft_ffi.PairedDevice
+import uniffi.glft_ffi.ReceivedInfo
 import uniffi.glft_ffi.StorageChoice
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 
 /** Where received files go, as the user chose it. */
@@ -51,6 +56,20 @@ class GlftApp : Application() {
     private val _saveTo = MutableStateFlow<SaveTo>(SaveTo.Downloads)
     val saveTo: StateFlow<SaveTo> = _saveTo
 
+    private val _devices = MutableStateFlow<List<PairedDevice>>(emptyList())
+    val devices: StateFlow<List<PairedDevice>> = _devices
+
+    /** Bytes verified of the transfer arriving now, or null when none is. */
+    private val _progress = MutableStateFlow<Pair<ULong, ULong>?>(null)
+    val progress: StateFlow<Pair<ULong, ULong>?> = _progress
+
+    private val _received = MutableStateFlow<List<ReceivedInfo>>(emptyList())
+    val received: StateFlow<List<ReceivedInfo>> = _received
+
+    fun refreshDevices() {
+        _devices.value = node.devices()
+    }
+
     override fun onCreate() {
         super.onCreate()
         Notifications.createChannels(this)
@@ -58,6 +77,27 @@ class GlftApp : Application() {
         val tree = prefs.getString("tree", null)
         val label = prefs.getString("treeLabel", null)
         if (tree != null && label != null) _saveTo.value = SaveTo.Picked(Uri.parse(tree), label)
+        _received.value = loadReceived()
+    }
+
+    private val receivedFile get() = File(filesDir, "received.json")
+
+    private fun loadReceived(): List<ReceivedInfo> = try {
+        val array = JSONArray(receivedFile.readText())
+        (0 until array.length()).map { i ->
+            val o = array.getJSONObject(i)
+            ReceivedInfo(o.getLong("at"), o.getString("peer"), o.getString("summary"), o.getInt("files").toUInt(), o.getString("dest"))
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+    private fun saveReceived(list: List<ReceivedInfo>) {
+        val array = JSONArray()
+        list.forEach {
+            array.put(JSONObject().put("at", it.atUnixMs).put("peer", it.peer).put("summary", it.summary).put("files", it.files.toInt()).put("dest", it.dest))
+        }
+        receivedFile.writeText(array.toString())
     }
 
     fun setSaveTo(choice: SaveTo) {
@@ -88,14 +128,30 @@ class GlftApp : Application() {
     fun note(sentence: String, isError: Boolean = false) =
         append(LogLine(System.currentTimeMillis(), sentence, isError, null, null))
 
-    private fun append(line: LogLine) = _log.update { (it + line).takeLast(500) }
+    private fun append(line: LogLine) {
+        // Debug builds also copy the log to logcat, so tests over adb can time events.
+        if (BuildConfig.DEBUG) Log.i("glft", line.sentence + (line.detail?.let { " [$it]" } ?: ""))
+        _log.update { (it + line).takeLast(500) }
+    }
+
+    /** Whether the main screen is visible; set by [MainActivity]. */
+    @Volatile
+    var inFront = false
+        set(value) {
+            field = value
+            // Offers still waiting move between the app's cards and notifications.
+            for (offer in _offers.value) {
+                if (value) Notifications.cancelOffer(this, offer.id) else Notifications.showOffer(this, offer)
+            }
+        }
 
     val listener = object : NodeListener {
         override fun onLog(line: LogLine) = append(line)
 
         override fun onOffer(offer: OfferInfo) {
             _offers.update { it + offer }
-            Notifications.showOffer(this@GlftApp, offer)
+            // On screen, the card in the app is the offer; a notification would show it twice.
+            if (!inFront) Notifications.showOffer(this@GlftApp, offer)
         }
 
         override fun onOfferClosed(id: ULong, missed: Boolean) {
@@ -107,7 +163,20 @@ class GlftApp : Application() {
 
         override fun onStopped(error: String?) {
             _receiving.value = false
+            _progress.value = null
             if (error != null) note(error, isError = true)
+        }
+
+        override fun onProgress(done: ULong, total: ULong) {
+            _progress.value = if (done >= total) null else done to total
+        }
+
+        override fun onReceived(received: ReceivedInfo) {
+            _progress.value = null
+            val list = (listOf(received) + _received.value).take(100)
+            _received.value = list
+            saveReceived(list)
+            refreshDevices()
         }
     }
 

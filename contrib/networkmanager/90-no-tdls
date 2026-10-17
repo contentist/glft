@@ -1,0 +1,17 @@
+#!/bin/sh
+# NetworkManager dispatcher script: turns off TDLS on Wi-Fi each time it comes up.
+#
+# Why: the Realtek RTL8852BE (driver rtw89_8852be) fails to set up TDLS direct links
+# ("TDLS: Failed to set TPK to the driver") and then stalls its transmit queues
+# ("rtw89_8852be: timed out to flush queues"), freezing the laptop's Wi-Fi for a while.
+# TDLS only lets two devices on the same router talk directly; without it they go
+# through the router, as most traffic does anyway.
+#
+# Install:  sudo install -m 755 -o root -g root contrib/networkmanager/90-no-tdls /etc/NetworkManager/dispatcher.d/
+# Remove:   sudo rm /etc/NetworkManager/dispatcher.d/90-no-tdls
+
+[ "$2" = "up" ] || exit 0
+case "$1" in
+    wl*) wpa_cli -i "$1" set tdls_disabled 1 >/dev/null 2>&1 ;;
+esac
+exit 0

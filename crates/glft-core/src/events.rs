@@ -5,7 +5,10 @@
 
 use std::{fmt, net::SocketAddr, sync::Arc};
 
-use crate::error::Error;
+use crate::{
+    devices::Remember,
+    error::Error,
+};
 
 /// Receives every event. Must be cheap; it is called from the transfer tasks.
 pub type EventSink = Arc<dyn Fn(Event) + Send + Sync>;
@@ -50,7 +53,21 @@ pub enum Event {
     Renamed { from: String, to: String },
     FileVerified { path: String, saved_to: String },
     FileSent { path: String },
+    /// Receiving: bytes verified so far in this transfer.
+    Progress { done: u64, total: u64 },
+    /// Receiving: an interrupted transfer continues without asking again.
+    ResumingReceive { peer: String, accepted_at: i64, files_done: usize, files: usize, bytes_left: u64 },
+    /// Sending: the receiver already had part of it.
+    ResumingSend { peer: String, files_done: usize, files: usize, bytes_left: u64 },
+    /// Sending: the connection broke; trying again until it works or is cancelled.
+    WaitingToResume { peer: String, files_done: usize, files: usize },
+    PairingPeer { peer: String, id: String },
+    PairingWrongCode { peer: String },
+    Paired { peer: String, ours: Remember, theirs: Remember },
+    /// Sending: everything arrived and was verified.
     Finished { peer: String, totals: Totals, secs: f64 },
+    /// Receiving: everything arrived and was verified.
+    Received { peer: String, totals: Totals, dest: String, secs: f64 },
     Failed(Error),
 }
 
@@ -87,12 +104,59 @@ impl fmt::Display for Event {
             Self::Renamed { from, to } => write!(f, "\"{from}\" already exists here; saving as \"{to}\""),
             Self::FileVerified { path, saved_to } => write!(f, "{path} verified, saved to {saved_to}"),
             Self::FileSent { path } => write!(f, "{path} sent"),
+            Self::Progress { done, total } => write!(f, "{} of {} verified", human_bytes(*done), human_bytes(*total)),
+            Self::ResumingReceive { peer, accepted_at, files_done, files, bytes_left } => write!(
+                f,
+                "Resuming the transfer from {peer} you accepted at {}: {files_done} of {} already here, {} left",
+                local_time(*accepted_at),
+                plural(*files, "file"),
+                human_bytes(*bytes_left)
+            ),
+            Self::ResumingSend { peer, files_done, files, bytes_left } => write!(
+                f,
+                "Resuming: {peer} already has {files_done} of {}; {} left",
+                plural(*files, "file"),
+                human_bytes(*bytes_left)
+            ),
+            Self::WaitingToResume { peer, files_done, files } => write!(
+                f,
+                "Connection to {peer} lost with {files_done} of {} done; waiting to resume (Ctrl-C stops)",
+                plural(*files, "file")
+            ),
+            Self::PairingPeer { peer, id } => write!(f, "{peer} ({id}) used the code; its key matches"),
+            Self::PairingWrongCode { peer } => {
+                write!(f, "A device ({peer}) tried to pair with a wrong code; the code still works")
+            }
+            Self::Paired { peer, ours, theirs } => {
+                match ours {
+                    Remember::Yes => write!(f, "Paired with {peer}; this device remembers it")?,
+                    Remember::JustThisTime => write!(f, "Paired with {peer} for this session only")?,
+                    Remember::No => write!(f, "Did not pair with {peer}")?,
+                }
+                match (ours, theirs) {
+                    (Remember::No, _) => Ok(()),
+                    (_, Remember::No) => write!(f, ". {peer} chose not to pair, so it will refuse files from this device"),
+                    (_, Remember::JustThisTime) => write!(f, ". {peer} paired for its current session only"),
+                    (_, Remember::Yes) => write!(f, ". {peer} remembers this device too"),
+                }
+            }
             Self::Finished { peer, totals, secs } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
                 write!(
                     f,
-                    "All {} verified with {peer} ({}, {:.1} s, {}/s)",
-                    plural(totals.files, "file"),
+                    "{} verified with {peer} ({}, {:.1} s, {}/s)",
+                    all_files(totals.files),
+                    human_bytes(totals.bytes),
+                    secs,
+                    human_bytes(rate as u64)
+                )
+            }
+            Self::Received { peer, totals, dest, secs } => {
+                let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
+                write!(
+                    f,
+                    "{} from {peer} verified and saved to {dest} ({}, {:.1} s, {}/s)",
+                    all_files(totals.files),
                     human_bytes(totals.bytes),
                     secs,
                     human_bytes(rate as u64)
@@ -101,6 +165,18 @@ impl fmt::Display for Event {
             Self::Failed(e) => write!(f, "{} {}", e.kind.headline(), e.kind.next_step()),
         }
     }
+}
+
+/// "14:03" today, "Mon 14:03" otherwise.
+pub fn local_time(unix: i64) -> String {
+    use chrono::{Local, TimeZone};
+    let Some(t) = Local.timestamp_opt(unix, 0).single() else { return "an earlier time".into() };
+    if t.date_naive() == Local::now().date_naive() { t.format("%H:%M").to_string() } else { t.format("%a %d %b %H:%M").to_string() }
+}
+
+/// "The file" or "All 14 files".
+fn all_files(n: usize) -> String {
+    if n == 1 { "The file".into() } else { format!("All {n} files") }
 }
 
 pub fn plural(n: usize, word: &str) -> String {

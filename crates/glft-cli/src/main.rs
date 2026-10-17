@@ -1,21 +1,26 @@
 //! `glft`: the terminal program, and the reference for what the window and phone show.
+//!
+//! Most commands are requests to the engine (`glftd`), which is started on first use and
+//! keeps running, so receiving, pairings and unfinished transfers outlive the terminal.
 
 use std::{
-    io::{BufRead, Write},
+    io::{BufRead, IsTerminal, Write},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
-    sync::Arc,
+    time::Duration,
 };
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use glft_core::{
-    Error, ErrorKind, Event,
-    events::EventSink,
-    identity, net, paths,
-    storage::FsStorage,
-    transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions},
+    Error, ErrorKind,
+    devices::Remember,
+    events::{human_bytes, local_time},
+    identity, paths,
+    storage::VERIFIED_XATTR,
 };
+use glft_engine::{Conn, ErrorInfo, LogLine, Reply, Request};
+use tokio::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "glft", version, about = "Send files directly between your devices, verified.")]
@@ -24,148 +29,597 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Print this device's id.
     Id,
-    /// Wait for files from another device.
+    /// Show what glft is doing: receiving, sending, offers waiting.
+    Status,
+    /// Switch receiving on or off. While on, paired devices can send files here.
     Receive {
+        #[arg(value_enum, default_value = "on")]
+        state: OnOff,
         /// Folder to save into [default: ~/Downloads/glft].
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Accept every offer without asking.
-        #[arg(long)]
-        yes: bool,
-        /// Stop after the first offer.
-        #[arg(long)]
-        once: bool,
         /// Listen on this UDP port instead of the preferred one (0 = any free port).
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Send files and folders to another device.
+    /// Show the event log.
+    Log {
+        /// Keep showing new lines until Ctrl-C.
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Show a pairing code for your phone (or another computer) to scan.
+    Pair,
+    /// Pair using another device's code, as printed under its QR code.
+    Join { code: String },
+    /// List paired devices.
+    Devices,
+    /// Forget a paired device; it can no longer send files here.
+    Forget { device: String },
+    /// Accept a paired device's files without asking, or ask again.
+    AutoAccept {
+        device: String,
+        #[arg(value_enum)]
+        state: OnOff,
+    },
+    /// Send files and folders to a paired device.
     Send {
-        /// The receiving device's id, as `glft receive` prints it.
+        /// The device's name or the start of its id, as `glft devices` lists it.
         device: String,
         /// Address of the receiving device, e.g. 192.168.1.40:47382; repeatable.
-        /// Without it, the device is looked for on the local network.
+        /// Without it, the device is looked for at its last address and on the local network.
         #[arg(long = "addr")]
         addrs: Vec<SocketAddr>,
+        /// Keep sending after this command exits.
+        #[arg(long)]
+        detach: bool,
         /// Files and folders to send.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// List offers waiting for an answer.
+    Offers,
+    /// Accept an offer (the only one waiting, or the one numbered).
+    Accept { offer: Option<u64> },
+    /// Decline an offer (the only one waiting, or the one numbered).
+    Decline { offer: Option<u64> },
+    /// Check received files against the fingerprints glft saved with them.
+    Verify {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Install the engine as a systemd user service (done automatically on first use).
+    Setup,
+    /// Restart the engine, e.g. after updating glft.
+    Restart,
+    /// Stop the engine; receiving stops too. The next command starts it again.
+    Quit,
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let events = printer();
-    match run(cli.command, &events).await {
-        Ok(()) => ExitCode::SUCCESS,
+    match run(cli.command).await {
+        Ok(code) => code,
         Err(e) => {
+            out().clear();
             print_error(&e);
             ExitCode::FAILURE
         }
     }
 }
 
-async fn run(command: Command, events: &EventSink) -> Result<(), Error> {
-    let data_dir = paths::data_dir()?;
-    let (secret, created) = identity::load_or_create(&data_dir)?;
-    if created {
-        events(Event::KeyCreated { id: secret.public().to_string() });
-    }
+type Result<T> = std::result::Result<T, ErrorInfo>;
+
+fn local(e: Error) -> ErrorInfo {
+    ErrorInfo::from(&e)
+}
+
+async fn run(command: Command) -> Result<ExitCode> {
     match command {
         Command::Id => {
+            let (secret, _) = identity::load_or_create(&paths::data_dir().map_err(local)?).map_err(local)?;
             println!("{}", secret.public());
-            Ok(())
         }
-        Command::Receive { dir, yes, once, port } => {
-            let dir = match dir {
-                Some(d) => std::path::absolute(&d).unwrap_or(d),
-                None => paths::default_receive_dir()?,
-            };
-            let endpoint = net::bind(secret, port, events).await?;
-            let id = endpoint.id();
-            let addrs = net::reachable_addrs(&endpoint).await;
-            println!();
-            println!("This device's id: {id}");
-            println!("To send here from another computer:");
-            println!("    glft send {id} <files or folders>");
-            if let Some(addr) = addrs.iter().filter(|a| a.is_ipv4() && !a.ip().is_loopback()).min_by_key(|a| lan_rank(a)) {
-                println!("If it is not found automatically, add: --addr {addr}");
+        Command::Status => {
+            let mut s = Session::open(Request::Status).await?;
+            while let Some(reply) = s.next().await? {
+                if let Reply::Status(st) = reply {
+                    println!("glft engine running (pid {}), version {}", st.pid, st.version.split(' ').next().unwrap_or_default());
+                    println!("This device: \"{}\", id {}", st.name, st.id);
+                    match st.receiving {
+                        Some(r) => {
+                            let addrs: Vec<String> = r.addrs.iter().map(|a| a.to_string()).collect();
+                            println!("Receiving: on, into {} ({})", r.folder, addrs.join(", "));
+                        }
+                        None => println!("Receiving: off (`glft receive on` switches it on)"),
+                    }
+                    for s in &st.sending {
+                        println!("Sending: {s}");
+                    }
+                    if st.offers > 0 {
+                        println!("Offers waiting: {} (`glft offers`)", st.offers);
+                    }
+                }
             }
-            println!();
-            let decide: Decide = if yes { Arc::new(|_| Box::pin(async { true })) } else { Arc::new(ask) };
-            let storage = FsStorage::new(dir.clone()).map_err(|e| Error::io(ErrorKind::ReceiveDirUnwritable, &dir, e))?;
-            // Pairing arrives on Day 3; until then every device may make an offer, and each
-            // offer is still asked about unless --yes is given.
-            let authorize: Authorize = Arc::new(|_| true);
-            let opts = ReceiveOptions { storage: Arc::new(storage), decide, authorize, once };
-            let result = tokio::select! {
-                r = transfer::serve(&endpoint, &opts, events) => r,
-                _ = tokio::signal::ctrl_c() => Ok(()),
-            };
-            endpoint.close().await;
-            result
         }
-        Command::Send { device, addrs, paths } => {
-            let peer = net::peer_addr(net::parse_id(&device)?, &addrs);
-            let endpoint = net::bind_ephemeral(secret).await?;
-            let result = transfer::send(&endpoint, peer, paths, events).await.map(|_| ());
-            endpoint.close().await;
-            result
+        Command::Receive { state, dir, port } => {
+            let dir = dir.map(|d| std::path::absolute(&d).unwrap_or(d));
+            let mut s = Session::open(Request::Receive { on: state == OnOff::On, dir, port }).await?;
+            s.drain().await?;
+            if state == OnOff::On {
+                out().line("Paired devices can now send files here. `glft receive off` stops it; `glft log -f` follows along.");
+            }
         }
-    }
-}
-
-/// Orders addresses by how likely they are the home network: 192.168/16, then 10/8,
-/// then 172.16/12 (where Docker and other bridges usually sit), then the rest.
-fn lan_rank(addr: &SocketAddr) -> u8 {
-    match addr.ip() {
-        std::net::IpAddr::V4(ip) => match ip.octets() {
-            [192, 168, ..] => 0,
-            [10, ..] => 1,
-            [172, b, ..] if (16..32).contains(&b) => 2,
-            _ => 3,
+        Command::Log { follow } => {
+            let mut s = Session::open(Request::Log { follow }).await?;
+            s.drain().await?;
+        }
+        Command::Pair => pair(Request::Pair).await?,
+        Command::Join { code } => pair(Request::Join { code }).await?,
+        Command::Devices => {
+            let mut s = Session::open(Request::Devices).await?;
+            while let Some(reply) = s.next().await? {
+                if let Reply::Devices { devices } = reply {
+                    if devices.is_empty() {
+                        println!("No paired devices. `glft pair` shows a code to scan with the phone.");
+                    }
+                    for d in devices {
+                        let kind = if d.remembered { "remembered" } else { "this session only" };
+                        let accept = if d.device.auto_accept { "accepts without asking" } else { "asks first" };
+                        let seen = d.device.last_seen.map(|t| format!(", last transfer {}", local_time(t))).unwrap_or_default();
+                        println!("{:<24} {}  {kind}, {accept}{seen}", d.device.name, d.device.short_id());
+                    }
+                }
+            }
+        }
+        Command::Forget { device } => Session::open(Request::Forget { device }).await?.drain().await?,
+        Command::AutoAccept { device, state } => {
+            Session::open(Request::AutoAccept { device, on: state == OnOff::On }).await?.drain().await?
+        }
+        Command::Send { device, addrs, detach, paths } => {
+            let paths = paths.into_iter().map(|p| std::path::absolute(&p).unwrap_or(p)).collect();
+            Session::open(Request::Send { device, addrs, paths, detach }).await?.drain().await?;
+        }
+        Command::Offers => {
+            for o in offers().await? {
+                println!("{:>3}  {} offers {}, to be saved to {}", o.id, o.peer, o.summary, o.dest);
+            }
+        }
+        Command::Accept { offer } => answer(offer, true).await?,
+        Command::Decline { offer } => answer(offer, false).await?,
+        Command::Verify { paths } => return Ok(verify(&paths)),
+        Command::Setup => {
+            install_units(true)?;
+        }
+        Command::Restart => {
+            if let Ok(s) = Session::try_open(Request::Quit).await {
+                let _ = s.finish().await;
+                wait_for_exit().await;
+            }
+            let mut s = Session::open(Request::Status).await?;
+            while let Some(reply) = s.next().await? {
+                if let Reply::Status(st) = reply {
+                    println!("glft engine restarted (pid {})", st.pid);
+                }
+            }
+        }
+        Command::Quit => match Session::try_open(Request::Quit).await {
+            Ok(s) => {
+                s.finish().await?;
+                println!("glft engine stopped");
+            }
+            Err(_) => println!("glft engine was not running"),
         },
-        _ => 4,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn offers() -> Result<Vec<glft_engine::OfferInfo>> {
+    let mut s = Session::open(Request::Offers).await?;
+    let mut list = Vec::new();
+    while let Some(reply) = s.next().await? {
+        if let Reply::Offers { offers } = reply {
+            list = offers;
+        }
+    }
+    if list.is_empty() {
+        out().line("No offers are waiting for an answer.");
+    }
+    Ok(list)
+}
+
+async fn answer(offer: Option<u64>, accept: bool) -> Result<()> {
+    let offer = match offer {
+        Some(o) => o,
+        None => {
+            let list = offers().await?;
+            match list.as_slice() {
+                [] => return Ok(()),
+                [one] => one.id,
+                many => {
+                    for o in many {
+                        println!("{:>3}  {} offers {}", o.id, o.peer, o.summary);
+                    }
+                    return Err(local(Error::new(ErrorKind::NoSuchOffer, "several offers are waiting; give the number")));
+                }
+            }
+        }
+    };
+    Session::open(Request::Answer { offer, accept }).await?.drain().await
+}
+
+/// `glft pair` and `glft join`: show or use the code, then ask "Remember this device?".
+async fn pair(request: Request) -> Result<()> {
+    let mut s = Session::open(request).await?;
+    while let Some(reply) = s.next().await? {
+        match reply {
+            Reply::PairCode { code } => {
+                print_qr(&code);
+                println!();
+                println!("{code}");
+                println!();
+                out().line("Scan this with glft on the phone (Pair with a computer), or run `glft join <code>` on another computer.");
+                out().line("The code works once, for 5 minutes. Ctrl-C cancels.");
+            }
+            Reply::PairPeer { name, .. } => {
+                let (remember, auto_accept) = tokio::task::spawn_blocking(move || ask_remember(&name)).await.unwrap_or((Remember::No, false));
+                s.conn.send(&Request::PairAnswer { remember, auto_accept }).await.map_err(lost_engine)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ask_remember(name: &str) -> (Remember, bool) {
+    let remember = loop {
+        let a = prompt(&format!("Remember \"{name}\"? [Y]es / [j]ust this time / [n]o: "));
+        match a.to_lowercase().as_str() {
+            "" | "y" | "yes" => break Remember::Yes,
+            "j" | "just this time" => break Remember::JustThisTime,
+            "n" | "no" => break Remember::No,
+            _ => println!("Please answer y, j or n."),
+        }
+    };
+    let auto = remember == Remember::Yes
+        && matches!(prompt(&format!("Accept files from \"{name}\" without asking? [y/N]: ")).to_lowercase().as_str(), "y" | "yes");
+    (remember, auto)
+}
+
+fn prompt(question: &str) -> String {
+    print!("{:>10}  {question}", "");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).ok();
+    line.trim().to_string()
+}
+
+/// Draws the code with half blocks, black on white whatever the terminal's theme, with
+/// the quiet zone scanners need.
+fn print_qr(code: &str) {
+    let Ok(qr) = qrcode::QrCode::with_error_correction_level(code, qrcode::EcLevel::M) else { return };
+    let width = qr.width();
+    let colors = qr.to_colors();
+    let quiet = 2isize;
+    let dark = |x: isize, y: isize| {
+        x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < width && colors[y as usize * width + x as usize] == qrcode::Color::Dark
+    };
+    let size = width as isize;
+    let mut y = -quiet;
+    while y < size + quiet {
+        let mut row = String::from("  \x1b[30;47m");
+        for x in -quiet..size + quiet {
+            row.push(match (dark(x, y), dark(x, y + 1)) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        row.push_str("\x1b[0m");
+        println!("{row}");
+        y += 2;
     }
 }
 
-/// Asks on the terminal whether to accept an offer.
-fn ask(offer: IncomingOffer) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
-    Box::pin(async move {
-        tokio::task::spawn_blocking(move || {
-            print!("{:>10}  Accept {} from {} into {}? [y/N] ", "", offer.totals, offer.peer, offer.dest);
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line).ok();
-            matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
-        })
-        .await
-        .unwrap_or(false)
-    })
-}
-
-/// Prints each event as `HH:MM:SS  sentence`; failures get their details indented below.
-fn printer() -> EventSink {
-    Arc::new(|event: Event| {
-        let time = chrono::Local::now().format("%H:%M:%S");
-        match &event {
-            Event::Failed(e) => {
-                eprintln!("{time}    {event}");
-                eprintln!("{:>10}  details: [{}] {}", "", e.kind.id(), e.detail);
+/// `glft verify`: re-hashes files and compares them with the fingerprint saved on arrival.
+fn verify(paths: &[PathBuf]) -> ExitCode {
+    let (mut ok, mut changed, mut unmarked) = (0, 0, 0);
+    for root in paths {
+        for entry in walkdir::WalkDir::new(root).sort_by_file_name().into_iter().flatten() {
+            if !entry.file_type().is_file() || entry.file_name().to_string_lossy().ends_with(glft_core::manifest::PARTIAL_SUFFIX) {
+                continue;
             }
-            _ => println!("{time}    {event}"),
+            let path = entry.path();
+            let mark = xattr::get(path, VERIFIED_XATTR).ok().flatten().and_then(|v| String::from_utf8(v).ok());
+            let Some(mark) = mark else {
+                unmarked += 1;
+                println!("  -  {}  (no glft fingerprint)", path.display());
+                continue;
+            };
+            match hash_file(path) {
+                Ok(h) if h == mark => {
+                    ok += 1;
+                    println!("  ✓  {}", path.display());
+                }
+                Ok(_) => {
+                    changed += 1;
+                    println!("  ✗  {}  CHANGED since it arrived", path.display());
+                }
+                Err(e) => {
+                    changed += 1;
+                    println!("  ✗  {}  could not be read: {e}", path.display());
+                }
+            }
         }
-    })
+    }
+    println!();
+    println!("{ok} verified, {changed} changed or unreadable, {unmarked} without a fingerprint");
+    if unmarked > 0 {
+        println!("Files without a fingerprint were not received by glft, or were copied without their extended attributes.");
+    }
+    if changed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
-fn print_error(e: &Error) {
+fn hash_file(path: &Path) -> std::io::Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+// ---------------------------------------------------------------- talking to the engine
+
+struct Session {
+    conn: Conn,
+}
+
+impl Session {
+    /// Sends `request`, starting the engine first if it is not running.
+    async fn open(request: Request) -> Result<Self> {
+        let stream = match connect().await {
+            Ok(s) => s,
+            Err(_) => {
+                start_engine()?;
+                let mut tries = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    match connect().await {
+                        Ok(s) => break s,
+                        Err(e) if tries > 40 => return Err(local(Error::new(ErrorKind::EngineNotRunning, e.to_string()))),
+                        Err(_) => tries += 1,
+                    }
+                }
+            }
+        };
+        Self::start(stream, request).await
+    }
+
+    /// Like [`Self::open`], but never starts the engine.
+    async fn try_open(request: Request) -> Result<Self> {
+        let stream = connect().await.map_err(|e| local(Error::new(ErrorKind::EngineNotRunning, e.to_string())))?;
+        Self::start(stream, request).await
+    }
+
+    async fn start(stream: UnixStream, request: Request) -> Result<Self> {
+        let mut conn = Conn::new(stream);
+        conn.send(&request).await.map_err(lost_engine)?;
+        // The heartbeat: a running engine acknowledges at once.
+        match tokio::time::timeout(glft_engine::HEARTBEAT, conn.recv::<Reply>()).await {
+            Ok(Ok(Some(Reply::Ack { version, .. }))) => {
+                if let Some(installed) = engine_build_id()
+                    && installed != version
+                {
+                    out().line("Note: the running engine is older than the installed glftd; `glft restart` switches to it.");
+                }
+                Ok(Self { conn })
+            }
+            Ok(_) => Err(local(Error::new(ErrorKind::EngineNotAnswering, "it closed the connection without answering"))),
+            Err(_) => Err(local(Error::new(ErrorKind::EngineNotAnswering, "no answer within 2 seconds"))),
+        }
+    }
+
+    /// The next reply that is not a log line or progress (those are printed), or `None`
+    /// when the request is done.
+    async fn next(&mut self) -> Result<Option<Reply>> {
+        loop {
+            match self.conn.recv::<Reply>().await.map_err(lost_engine)? {
+                None => return Err(lost_engine("the connection closed")),
+                Some(Reply::Line(l)) => out().log(&l),
+                Some(Reply::Progress { done, total }) => out().progress(done, total),
+                Some(Reply::Done) => {
+                    out().clear();
+                    return Ok(None);
+                }
+                Some(Reply::Failed(e)) => return Err(e),
+                Some(Reply::Offer(o)) => {
+                    out().line(&format!("{} offers {}; `glft accept {}` or `glft decline {}`", o.peer, o.summary, o.id, o.id));
+                }
+                Some(other) => return Ok(Some(other)),
+            }
+        }
+    }
+
+    async fn drain(&mut self) -> Result<()> {
+        while self.next().await?.is_some() {}
+        Ok(())
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.drain().await
+    }
+}
+
+fn lost_engine(e: impl std::fmt::Display) -> ErrorInfo {
+    local(Error::new(ErrorKind::EngineNotAnswering, e.to_string()))
+}
+
+async fn connect() -> std::io::Result<UnixStream> {
+    let path = glft_engine::socket_path().map_err(|e| std::io::Error::other(e.detail))?;
+    UnixStream::connect(path).await
+}
+
+async fn wait_for_exit() {
+    for _ in 0..30 {
+        if connect().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn engine_path() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
+    exe.parent().map(|d| d.join("glftd")).unwrap_or_else(|| PathBuf::from("glftd"))
+}
+
+/// The build id `glftd` on disk would report, to spot a running engine that is older.
+fn engine_build_id() -> Option<String> {
+    let mtime = std::fs::metadata(engine_path()).ok()?.modified().ok()?;
+    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{} {secs}", env!("CARGO_PKG_VERSION")))
+}
+
+fn systemd_user_available() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "show-environment"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Starts the engine: through systemd's socket when it can, else as a plain background
+/// process (and always so when GLFT_RUNTIME_DIR points at a private socket).
+fn start_engine() -> Result<()> {
+    if std::env::var_os(glft_engine::RUNTIME_DIR_ENV).is_none() && systemd_user_available() {
+        install_units(false)?;
+        let started = std::process::Command::new("systemctl").args(["--user", "start", "glft.socket"]).status();
+        if started.is_ok_and(|s| s.success()) {
+            return Ok(());
+        }
+    }
+    let data_dir = paths::data_dir().map_err(local)?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &data_dir, e)))?;
+    let log_path = data_dir.join("engine.log");
+    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &log_path, e)))?;
+    let err_log = log.try_clone().map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &log_path, e)))?;
+    use std::os::unix::process::CommandExt;
+    std::process::Command::new(engine_path())
+        .stdin(std::process::Stdio::null())
+        .stdout(log)
+        .stderr(err_log)
+        // Its own process group, so Ctrl-C in this terminal does not stop it.
+        .process_group(0)
+        .spawn()
+        .map_err(|e| local(Error::new(ErrorKind::EngineNotRunning, format!("{}: {e}", engine_path().display()))))?;
+    Ok(())
+}
+
+/// Writes the systemd user units if they are missing or point at another `glftd`.
+fn install_units(verbose: bool) -> Result<()> {
+    let dir = glft_engine::unit_dir().map_err(local)?;
+    let engine = std::fs::canonicalize(engine_path()).unwrap_or_else(|_| engine_path());
+    let units = [("glft.socket", glft_engine::SOCKET_UNIT.to_string()), ("glft.service", glft_engine::service_unit(&engine))];
+    let mut changed = false;
+    for (name, content) in &units {
+        let path = dir.join(name);
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
+            std::fs::create_dir_all(&dir).map_err(|e| local(Error::io(ErrorKind::EngineNotRunning, &dir, e)))?;
+            std::fs::write(&path, content).map_err(|e| local(Error::io(ErrorKind::EngineNotRunning, &path, e)))?;
+            changed = true;
+        }
+    }
+    if changed {
+        let systemctl = |args: &[&str]| std::process::Command::new("systemctl").arg("--user").args(args).status();
+        let _ = systemctl(&["daemon-reload"]);
+        let _ = systemctl(&["enable", "glft.socket"]);
+        out().line(&format!(
+            "Set up glft's engine as a systemd user service (glft.socket, glft.service in {}). It starts when a glft command needs it and listens on the network only while receiving is on.",
+            tilde(&dir)
+        ));
+    } else if verbose {
+        out().line(&format!("glft's engine is set up (units in {})", tilde(&dir)));
+    }
+    Ok(())
+}
+
+fn tilde(path: &Path) -> String {
+    let p = path.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && p.starts_with(&home) => format!("~{}", &p[home.len()..]),
+        _ => p,
+    }
+}
+
+// ---------------------------------------------------------------- output
+
+/// Prints `HH:MM:SS  sentence`, with a progress line kept at the bottom on a terminal.
+struct Out {
+    tty: bool,
+}
+
+fn out() -> Out {
+    Out { tty: std::io::stdout().is_terminal() }
+}
+
+static PROGRESS_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl Out {
+    fn clear(&self) {
+        if PROGRESS_SHOWN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            print!("\r\x1b[2K");
+            let _ = std::io::stdout().flush();
+        }
+    }
+
+    fn line(&self, sentence: &str) {
+        self.clear();
+        println!("{}    {sentence}", chrono::Local::now().format("%H:%M:%S"));
+    }
+
+    fn log(&self, l: &LogLine) {
+        self.clear();
+        let time = chrono::DateTime::from_timestamp_millis(l.at_unix_ms)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        if l.is_error {
+            eprintln!("{time}    {}", l.sentence);
+            if let Some(n) = &l.next_step {
+                eprintln!("{:>10}  What to do: {n}", "");
+            }
+            if let Some(d) = &l.detail {
+                eprintln!("{:>10}  details: {d}", "");
+            }
+        } else {
+            println!("{time}    {}", l.sentence);
+        }
+    }
+
+    fn progress(&self, done: u64, total: u64) {
+        if !self.tty {
+            return;
+        }
+        let pct = (done * 100).checked_div(total).unwrap_or(100);
+        print!("\r\x1b[2K{:>10}  {} of {} verified ({pct}%)", "", human_bytes(done), human_bytes(total));
+        let _ = std::io::stdout().flush();
+        PROGRESS_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn print_error(e: &ErrorInfo) {
     let time = chrono::Local::now().format("%H:%M:%S");
-    eprintln!("{time}    {}", e.kind.headline());
-    eprintln!("{:>10}  What to do: {}", "", e.kind.next_step());
-    eprintln!("{:>10}  details: [{}] {}", "", e.kind.id(), e.detail);
+    eprintln!("{time}    {}", e.headline);
+    eprintln!("{:>10}  What to do: {}", "", e.next_step);
+    eprintln!("{:>10}  details: [{}] {}", "", e.id, e.detail);
 }

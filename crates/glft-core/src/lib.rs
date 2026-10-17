@@ -4,13 +4,16 @@
 //! so it holds no terminal or UI code. Everything it does is reported through
 //! [`events::Event`]s, which are written as plain sentences.
 
+pub mod devices;
 pub mod error;
 pub mod events;
 pub mod identity;
 pub mod manifest;
 pub mod net;
+pub mod pairing;
 pub mod paths;
 pub mod proto;
+pub mod resume;
 pub mod storage;
 pub mod transfer;
 

@@ -1,0 +1,25 @@
+[package]
+name = "glft-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "glft_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "glftd"
+path = "src/main.rs"
+
+[dependencies]
+glft-core.workspace = true
+iroh.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+notify-rust.workspace = true
+libc.workspace = true
+tracing-subscriber.workspace = true

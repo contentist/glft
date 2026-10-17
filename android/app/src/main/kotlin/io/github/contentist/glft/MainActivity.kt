@@ -31,6 +31,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -40,6 +41,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -65,6 +67,16 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
+    override fun onStart() {
+        super.onStart()
+        glft.inFront = true
+    }
+
+    override fun onStop() {
+        glft.inFront = false
+        super.onStop()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -86,7 +98,14 @@ private fun Screen() {
     val offers by app.offers.collectAsStateWithLifecycle()
     val receiving by app.receiving.collectAsStateWithLifecycle()
     val saveTo by app.saveTo.collectAsStateWithLifecycle()
+    val devices by app.devices.collectAsStateWithLifecycle()
+    val progress by app.progress.collectAsStateWithLifecycle()
+    val received by app.received.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    var pairing by remember { mutableStateOf(false) }
+    // Set when the network explanation was shown for pairing rather than receiving.
+    var forPairing by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { app.refreshDevices() }
     // Re-read permissions whenever the screen comes back, e.g. from glft's settings.
     var resumed by remember { mutableIntStateOf(0) }
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { resumed++ }
@@ -101,7 +120,9 @@ private fun Screen() {
         resumed++
         explaining = false
         refused = Access.of(context).missingRuntime.isNotEmpty()
-        if (!refused) startReceiving()
+        if (!refused) {
+            if (forPairing) pairing = true else startReceiving()
+        }
     }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { tree: Uri? ->
         if (tree != null) {
@@ -109,6 +130,11 @@ private fun Screen() {
             context.contentResolver.takePersistableUriPermission(tree, flags)
             app.setSaveTo(SaveTo.Picked(tree, SafStorage(context.contentResolver, tree).label))
         }
+    }
+
+    if (pairing) {
+        PairScreen(onClose = { pairing = false; app.refreshDevices() })
+        return
     }
 
     LazyColumn(
@@ -151,6 +177,7 @@ private fun Screen() {
                     )
                     Switch(checked = receiving, onCheckedChange = { on ->
                         val now = Access.of(context)
+                        forPairing = false
                         when {
                             !on -> context.startService(Intent(context, ReceiveService::class.java).setAction(ReceiveService.ACTION_STOP))
                             now.ready -> startReceiving()
@@ -159,17 +186,73 @@ private fun Screen() {
                         }
                     })
                 }
-                if (explaining || refused || !access.network) {
+                if (!forPairing && (explaining || refused || !access.network)) {
                     PermissionHelp(
                         access = access,
                         refused = refused,
                         onContinue = { permissions.launch(access.missingRuntime.toTypedArray()) },
                     )
                 }
-                Text(
-                    "Paired devices: ${app.node.allowedDevices().size}. Pairing by QR code comes next; until then, debug builds add a device over USB.",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                progress?.let { (done, total) ->
+                    LinearProgressIndicator(
+                        progress = { if (total > 0u) done.toFloat() / total.toFloat() else 0f },
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    )
+                    Text("${size(done)} of ${size(total)} verified", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+
+        item {
+            Section("Paired devices") {
+                if (devices.isEmpty()) {
+                    Text("None yet. Only paired devices can send files to this phone.", style = MaterialTheme.typography.bodySmall)
+                }
+                devices.forEach { d ->
+                    Column(Modifier.padding(vertical = 4.dp)) {
+                        Text(d.name, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            buildString {
+                                append(if (d.remembered) "Remembered" else "Until receiving is switched off")
+                                append(" · ${d.id.take(10)}")
+                                d.lastSeenUnix?.let { append(" · last transfer ${SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(it * 1000))}") }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (d.remembered) {
+                                Text("Accept its files without asking", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                                Switch(checked = d.autoAccept, onCheckedChange = { on ->
+                                    app.node.setAutoAccept(d.id, on)
+                                    app.refreshDevices()
+                                })
+                            } else {
+                                Spacer(Modifier.weight(1f))
+                            }
+                            TextButton(onClick = {
+                                app.node.forget(d.id)
+                                app.note("Forgot \"${d.name}\"; it can no longer send files to this phone")
+                                app.refreshDevices()
+                            }) { Text("Forget") }
+                        }
+                    }
+                }
+                OutlinedButton(onClick = {
+                    val now = Access.of(context)
+                    if (now.network && now.localNetwork) {
+                        pairing = true
+                    } else {
+                        forPairing = true
+                        explaining = true
+                    }
+                }) { Text("Pair with a computer") }
+                if (forPairing && (explaining || refused || !access.network)) {
+                    PermissionHelp(
+                        access = access,
+                        refused = refused,
+                        onContinue = { permissions.launch(access.missingRuntime.toTypedArray()) },
+                    )
+                }
             }
         }
 
@@ -212,6 +295,19 @@ private fun Screen() {
                             onClick = { run("picked folder") { app.storageChoice() } },
                         ) { Text("Picked") }
                     }
+                }
+            }
+        }
+
+        if (received.isNotEmpty()) {
+            item { Text("Received", style = MaterialTheme.typography.titleMedium) }
+            items(received.take(10), key = { "received-${it.atUnixMs}" }) { r ->
+                Column {
+                    Text(if (r.files == 1u) "✓ Verified · ${r.summary}" else "✓ All ${r.files} files verified · ${r.summary}", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "From ${r.peer} · ${r.dest} · ${SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(r.atUnixMs))}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
                 }
             }
         }
@@ -314,6 +410,20 @@ private data class Access(val network: Boolean, val localNetwork: Boolean, val n
             )
         }
     }
+}
+
+/** Sizes in decimal units, as the core and file managers show them. */
+private fun size(bytes: ULong): String {
+    val units = listOf("KB", "MB", "GB", "TB")
+    if (bytes < 1000u) return "$bytes bytes"
+    var v = bytes.toDouble()
+    var unit = ""
+    for (u in units) {
+        v /= 1000
+        unit = u
+        if (v < 1000) break
+    }
+    return if (v < 10) "%.1f %s".format(v, unit) else "%.0f %s".format(v, unit)
 }
 
 /** Opens the folder picker at Download, where Android lets the user make a subfolder. */

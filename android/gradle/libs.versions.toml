@@ -7,6 +7,8 @@ coreKtx = "1.19.1"
 lifecycle = "2.11.0"
 coroutines = "1.11.0"
 jna = "5.19.1"
+camerax = "1.6.2"
+zxingCpp = "3.1.1"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -18,6 +20,10 @@ compose-material3 = { module = "androidx.compose.material3:material3" }
 compose-ui-tooling-preview = { module = "androidx.compose.ui:ui-tooling-preview" }
 kotlinx-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+camerax-camera2 = { module = "androidx.camera:camera-camera2", version.ref = "camerax" }
+camerax-lifecycle = { module = "androidx.camera:camera-lifecycle", version.ref = "camerax" }
+camerax-view = { module = "androidx.camera:camera-view", version.ref = "camerax" }
+zxing-cpp = { module = "io.github.zxing-cpp:android", version.ref = "zxingCpp" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

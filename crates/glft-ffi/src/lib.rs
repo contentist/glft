@@ -6,13 +6,13 @@
 //! decides anything: it adapts glft-core's types to ones UniFFI can carry.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs::File,
     io,
     os::fd::FromRawFd,
     path::PathBuf,
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -20,10 +20,13 @@ use std::{
 
 use glft_core::{
     Error, Event, ErrorKind,
+    devices::{Device, DeviceStore, Remember},
     events::EventSink,
     identity, net,
+    pairing::{self, PairingCode},
+    resume::Records,
     storage::{FsStorage, Partial, ReceiveStorage},
-    transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions},
+    transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions, Seen},
 };
 use tokio::{runtime::Runtime, sync::oneshot, task::JoinHandle};
 
@@ -115,8 +118,12 @@ pub struct OpenedPartial {
 #[uniffi::export(with_foreign)]
 pub trait StorageBackend: Send + Sync {
     fn exists(&self, rel: String) -> Result<bool, StorageError>;
+    /// A finished file is at `rel`; files still arriving (pending) do not count.
+    fn published(&self, rel: String) -> Result<bool, StorageError>;
     fn make_dir(&self, rel: String) -> Result<(), StorageError>;
     fn create_partial(&self, rel: String) -> Result<OpenedPartial, StorageError>;
+    /// Opens a partial from an interrupted transfer by its token, or `None` if it is gone.
+    fn reopen_partial(&self, rel: String, token: String) -> Result<Option<OpenedPartial>, StorageError>;
     /// Publishes the partial under `rel`; the fd has already been synced and closed.
     fn finish(&self, rel: String, token: String) -> Result<(), StorageError>;
     fn discard(&self, token: String) -> Result<(), StorageError>;
@@ -152,6 +159,66 @@ pub trait NodeListener: Send + Sync {
     fn on_offer_closed(&self, id: u64, missed: bool);
     /// Receiving ended, on request or because of `error`.
     fn on_stopped(&self, error: Option<String>);
+    /// Bytes verified so far in the transfer arriving now.
+    fn on_progress(&self, done: u64, total: u64);
+    /// A transfer arrived complete, every file verified.
+    fn on_received(&self, received: ReceivedInfo);
+}
+
+/// A finished incoming transfer, for the Received list.
+#[derive(uniffi::Record)]
+pub struct ReceivedInfo {
+    pub at_unix_ms: i64,
+    pub peer: String,
+    pub summary: String,
+    pub files: u32,
+    pub dest: String,
+}
+
+/// "Remember this device?"
+#[derive(uniffi::Enum, Clone, Copy, PartialEq, Eq)]
+pub enum RememberChoice {
+    Yes,
+    JustThisTime,
+    No,
+}
+
+impl From<RememberChoice> for Remember {
+    fn from(c: RememberChoice) -> Self {
+        match c {
+            RememberChoice::Yes => Remember::Yes,
+            RememberChoice::JustThisTime => Remember::JustThisTime,
+            RememberChoice::No => Remember::No,
+        }
+    }
+}
+
+impl From<Remember> for RememberChoice {
+    fn from(r: Remember) -> Self {
+        match r {
+            Remember::Yes => RememberChoice::Yes,
+            Remember::JustThisTime => RememberChoice::JustThisTime,
+            Remember::No => RememberChoice::No,
+        }
+    }
+}
+
+/// The other device in a pairing that is waiting for "Remember this device?".
+#[derive(uniffi::Record)]
+pub struct PairingPeer {
+    pub name: String,
+    pub id: String,
+}
+
+/// A paired device.
+#[derive(uniffi::Record)]
+pub struct PairedDevice {
+    pub id: String,
+    pub name: String,
+    pub auto_accept: bool,
+    /// False for a "just this time" pairing, which ends when receiving is switched off.
+    pub remembered: bool,
+    pub last_seen_unix: Option<i64>,
 }
 
 // ---------------------------------------------------------------- storage adapters
@@ -162,6 +229,9 @@ impl ReceiveStorage for ForeignStorage {
     fn exists(&self, rel: &str) -> io::Result<bool> {
         Ok(self.0.exists(rel.into())?)
     }
+    fn published(&self, rel: &str) -> io::Result<bool> {
+        Ok(self.0.published(rel.into())?)
+    }
     fn make_dir(&self, rel: &str) -> io::Result<()> {
         Ok(self.0.make_dir(rel.into())?)
     }
@@ -171,7 +241,14 @@ impl ReceiveStorage for ForeignStorage {
         let file = unsafe { File::from_raw_fd(opened.fd) };
         Ok(Partial { file, rel: rel.into(), token: opened.token })
     }
-    fn finish(&self, partial: Partial) -> io::Result<()> {
+    fn reopen_partial(&self, rel: &str, token: &str) -> io::Result<Option<Partial>> {
+        Ok(self.0.reopen_partial(rel.into(), token.into())?.map(|opened| {
+            // SAFETY: as in create_partial, the descriptor's ownership is handed to us.
+            let file = unsafe { File::from_raw_fd(opened.fd) };
+            Partial { file, rel: rel.into(), token: opened.token }
+        }))
+    }
+    fn finish(&self, partial: Partial, _hash: &[u8; 32]) -> io::Result<()> {
         partial.file.sync_all()?;
         drop(partial.file);
         Ok(self.0.finish(partial.rel, partial.token)?)
@@ -179,6 +256,9 @@ impl ReceiveStorage for ForeignStorage {
     fn discard(&self, partial: Partial) -> io::Result<()> {
         drop(partial.file);
         Ok(self.0.discard(partial.token)?)
+    }
+    fn discard_abandoned(&self, token: &str) -> io::Result<()> {
+        Ok(self.0.discard(token.into())?)
     }
     fn describe(&self, rel: &str) -> String {
         self.0.describe(rel.into())
@@ -204,17 +284,26 @@ impl ReceiveStorage for LabelledFs {
     fn exists(&self, rel: &str) -> io::Result<bool> {
         self.fs.exists(rel)
     }
+    fn published(&self, rel: &str) -> io::Result<bool> {
+        self.fs.published(rel)
+    }
     fn make_dir(&self, rel: &str) -> io::Result<()> {
         self.fs.make_dir(rel)
     }
     fn create_partial(&self, rel: &str) -> io::Result<Partial> {
         self.fs.create_partial(rel)
     }
-    fn finish(&self, partial: Partial) -> io::Result<()> {
-        self.fs.finish(partial)
+    fn reopen_partial(&self, rel: &str, token: &str) -> io::Result<Option<Partial>> {
+        self.fs.reopen_partial(rel, token)
+    }
+    fn finish(&self, partial: Partial, hash: &[u8; 32]) -> io::Result<()> {
+        self.fs.finish(partial, hash)
     }
     fn discard(&self, partial: Partial) -> io::Result<()> {
         self.fs.discard(partial)
+    }
+    fn discard_abandoned(&self, token: &str) -> io::Result<()> {
+        self.fs.discard_abandoned(token)
     }
     fn describe(&self, rel: &str) -> String {
         let full = self.fs.describe(rel);
@@ -243,64 +332,46 @@ struct Running {
     task: JoinHandle<()>,
 }
 
-/// This device: its key, the devices allowed to connect, and receiving.
+/// This device: its key, the paired devices, pairing and receiving.
 #[derive(uniffi::Object)]
 pub struct Node {
     secret: iroh::SecretKey,
     data_dir: PathBuf,
-    allowed: Arc<RwLock<HashSet<iroh::EndpointId>>>,
+    devices: Arc<Mutex<DeviceStore>>,
     offers: Arc<Mutex<HashMap<u64, oneshot::Sender<bool>>>>,
     next_offer: Arc<AtomicU64>,
     running: Mutex<Option<Running>>,
     starting: Mutex<()>,
+    pairing: Mutex<Option<pairing::Pending>>,
 }
-
-const ALLOWED_FILE: &str = "allowed-devices.txt";
 
 #[uniffi::export]
 impl Node {
-    /// Loads or creates the device key and the allowed-devices list in `data_dir`.
+    /// Loads or creates the device key and the paired-device list in `data_dir`.
     /// `device_name` is what other devices see, e.g. "Pixel 8 Pro".
     #[uniffi::constructor]
     pub fn new(data_dir: String, device_name: String) -> Result<Arc<Self>, GlftError> {
         glft_core::paths::set_device_name(device_name);
         let data_dir = PathBuf::from(data_dir);
         let (secret, _) = identity::load_or_create(&data_dir)?;
-        let allowed = std::fs::read_to_string(data_dir.join(ALLOWED_FILE))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| net::parse_id(l).ok())
-            .collect();
+        // The Day 2 debug list of allowed keys is replaced by pairing.
+        let _ = std::fs::remove_file(data_dir.join("allowed-devices.txt"));
+        let devices = DeviceStore::load(&data_dir)?;
         Ok(Arc::new(Self {
             secret,
             data_dir,
-            allowed: Arc::new(RwLock::new(allowed)),
+            devices: Arc::new(Mutex::new(devices)),
             offers: Default::default(),
             next_offer: Arc::new(AtomicU64::new(1)),
             running: Mutex::new(None),
             starting: Mutex::new(()),
+            pairing: Mutex::new(None),
         }))
     }
 
     /// The device id other devices dial.
     pub fn id(&self) -> String {
         self.secret.public().to_string()
-    }
-
-    /// Allows a device to connect. Day 3's QR pairing calls this; until then, debug builds
-    /// call it from an adb broadcast.
-    pub fn allow_device(&self, id: String) -> Result<(), GlftError> {
-        let id = net::parse_id(&id)?;
-        let mut allowed = self.allowed.write().unwrap();
-        allowed.insert(id);
-        let text: String = allowed.iter().map(|k| format!("{k}\n")).collect();
-        std::fs::write(self.data_dir.join(ALLOWED_FILE), text)
-            .map_err(|e| Error::io(ErrorKind::DataDirUnwritable, &self.data_dir, e))?;
-        Ok(())
-    }
-
-    pub fn allowed_devices(&self) -> Vec<String> {
-        self.allowed.read().unwrap().iter().map(|k| k.to_string()).collect()
     }
 
     pub fn is_receiving(&self) -> bool {
@@ -312,32 +383,37 @@ impl Node {
     pub fn start_receiving(&self, storage: StorageChoice, listener: Arc<dyn NodeListener>) -> Result<(), GlftError> {
         // One start at a time: a second one waits, then replaces the first.
         let _starting = self.starting.lock().unwrap();
-        self.stop();
+        self.stop_endpoint();
         let storage = open_storage(storage)?;
         let events = sink(listener.clone());
         let endpoint = runtime().block_on(net::bind(self.secret.clone(), None, &events))?;
-        let allowed = self.allowed.clone();
-        let authorize: Authorize = Arc::new(move |id| allowed.read().unwrap().contains(id));
-        let decide = self.decider(listener.clone());
-        let opts = ReceiveOptions { storage, decide, authorize, once: false };
+        let devices = self.devices.clone();
+        let authorize: Authorize = Arc::new(move |id| devices.lock().unwrap().is_paired(id));
+        let devices = self.devices.clone();
+        let seen: Seen = Arc::new(move |id, name| {
+            let _ = devices.lock().unwrap().seen(id, Some(name), &[]);
+        });
+        let opts = Arc::new(ReceiveOptions {
+            storage,
+            decide: self.decider(listener.clone()),
+            authorize,
+            records: Records::new(&self.data_dir),
+            seen: Some(seen),
+            once: false,
+        });
         let ep = endpoint.clone();
         let task = runtime().spawn(async move {
-            let result = transfer::serve(&ep, &opts, &events).await;
+            let result = transfer::serve(&ep, opts, &events).await;
             listener.on_stopped(result.err().map(|e| e.kind.headline().to_string()));
         });
         *self.running.lock().unwrap() = Some(Running { endpoint, task });
         Ok(())
     }
 
-    /// Stops listening and closes the network socket.
+    /// Stops listening and closes the network socket. "Just this time" pairings end here.
     pub fn stop(&self) {
-        if let Some(running) = self.running.lock().unwrap().take() {
-            runtime().block_on(running.endpoint.close());
-            running.task.abort();
-        }
-        for (_, answer) in self.offers.lock().unwrap().drain() {
-            let _ = answer.send(false);
-        }
+        self.stop_endpoint();
+        self.devices.lock().unwrap().end_session();
     }
 
     /// Answers an offer announced through [`NodeListener::on_offer`].
@@ -345,6 +421,68 @@ impl Node {
         if let Some(answer) = self.offers.lock().unwrap().remove(&id) {
             let _ = answer.send(accept);
         }
+    }
+
+    /// Uses a pairing code (scanned or pasted): connects to the computer that shows it and
+    /// proves this device read it. Blocks until the computer answers (seconds); call it off
+    /// the main thread, then ask the person and call [`Node::answer_pairing`].
+    pub fn pair(&self, code: String, listener: Arc<dyn NodeListener>) -> Result<PairingPeer, GlftError> {
+        let code = PairingCode::parse(&code)?;
+        let events = sink(listener);
+        let receive_addrs = self.receive_addrs();
+        let pending = runtime().block_on(pairing::join(self.secret.clone(), &code, receive_addrs, &events))?;
+        let peer = PairingPeer { name: pending.peer.name.clone(), id: pending.peer.id.clone() };
+        if let Some(old) = self.pairing.lock().unwrap().replace(pending) {
+            runtime().spawn(old.cancel());
+        }
+        Ok(peer)
+    }
+
+    /// Sends this side's answer to "Remember this device?" and returns the other side's.
+    /// Blocks until the person at the computer has answered too.
+    pub fn answer_pairing(&self, remember: RememberChoice, auto_accept: bool, listener: Arc<dyn NodeListener>) -> Result<RememberChoice, GlftError> {
+        let pending = self
+            .pairing
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| Error::new(ErrorKind::PairingAbandoned, "no pairing is waiting for an answer"))?;
+        let peer = pending.peer.clone();
+        let events = sink(listener);
+        let ours = Remember::from(remember);
+        let theirs = runtime().block_on(pending.finish(ours, &events))?;
+        let device = Device { auto_accept: ours == Remember::Yes && auto_accept, ..peer };
+        self.devices.lock().unwrap().pair(device, ours)?;
+        Ok(theirs.into())
+    }
+
+    /// Abandons a pairing waiting for an answer.
+    pub fn cancel_pairing(&self) {
+        if let Some(p) = self.pairing.lock().unwrap().take() {
+            runtime().spawn(p.cancel());
+        }
+    }
+
+    pub fn devices(&self) -> Vec<PairedDevice> {
+        self.devices
+            .lock()
+            .unwrap()
+            .list()
+            .into_iter()
+            .map(|(d, remembered)| PairedDevice { id: d.id, name: d.name, auto_accept: d.auto_accept, remembered, last_seen_unix: d.last_seen })
+            .collect()
+    }
+
+    pub fn forget(&self, id: String) -> Result<(), GlftError> {
+        let id = net::parse_id(&id)?;
+        self.devices.lock().unwrap().forget(&id)?;
+        Ok(())
+    }
+
+    pub fn set_auto_accept(&self, id: String, on: bool) -> Result<(), GlftError> {
+        let id = net::parse_id(&id)?;
+        self.devices.lock().unwrap().set_auto_accept(&id, on)?;
+        Ok(())
     }
 
     /// Times the storage path the way a real transfer uses it: `files` files of `size`
@@ -358,10 +496,49 @@ impl Node {
 }
 
 impl Node {
+    fn stop_endpoint(&self) {
+        if let Some(Running { endpoint, task }) = self.running.lock().unwrap().take() {
+            let ports: Vec<u16> = endpoint.bound_sockets().iter().map(|a| a.port()).collect();
+            // Cancel first: a serve that ends because its endpoint closed reports
+            // "stopped", which here would switch the app's receiving switch off while the
+            // replacement is already being started.
+            runtime().block_on(async {
+                task.abort();
+                let _ = task.await;
+                endpoint.close().await;
+            });
+            drop(endpoint);
+            // The port is free only once every connection has let go of the endpoint. A
+            // restart (new Wi-Fi address) should get the same port back, not a random one.
+            if let Some(&port) = ports.first() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).is_err() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        for (_, answer) in self.offers.lock().unwrap().drain() {
+            let _ = answer.send(false);
+        }
+    }
+
+    /// Where this phone receives, to tell a computer during pairing.
+    fn receive_addrs(&self) -> Vec<std::net::SocketAddr> {
+        let endpoint = self.running.lock().unwrap().as_ref().map(|r| r.endpoint.clone());
+        match endpoint {
+            Some(ep) => runtime().block_on(net::reachable_addrs(&ep)),
+            None => Vec::new(),
+        }
+    }
+
     fn decider(&self, listener: Arc<dyn NodeListener>) -> Decide {
         let offers = self.offers.clone();
         let next = self.next_offer.clone();
+        let devices = self.devices.clone();
         Arc::new(move |offer: IncomingOffer| {
+            if devices.lock().unwrap().auto_accept(&offer.id) {
+                return Box::pin(async { true });
+            }
             let id = next.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = oneshot::channel();
             offers.lock().unwrap().insert(id, tx);
@@ -396,6 +573,19 @@ impl Drop for OfferGuard {
 fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
     Arc::new(move |event: Event| {
         let at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        if let Event::Progress { done, total } = event {
+            listener.on_progress(done, total);
+            return;
+        }
+        if let Event::Received { peer, totals, dest, .. } = &event {
+            listener.on_received(ReceivedInfo {
+                at_unix_ms,
+                peer: peer.clone(),
+                summary: totals.to_string(),
+                files: totals.files as u32,
+                dest: dest.clone(),
+            });
+        }
         let (is_error, next_step, detail) = match &event {
             Event::Failed(e) => (true, Some(e.kind.next_step().to_string()), Some(format!("[{}] {}", e.kind.id(), e.detail))),
             _ => (false, None, None),
@@ -445,7 +635,7 @@ fn bench(storage: &dyn ReceiveStorage, files: u32, size: u32) -> Result<String, 
                         partial.file.write_all(&data).map_err(|e| err(&rel, e))?;
                         write.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                         let t = Instant::now();
-                        storage.finish(partial).map_err(|e| err(&rel, e))?;
+                        storage.finish(partial, &[0; 32]).map_err(|e| err(&rel, e))?;
                         finish.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                         Ok(())
                     };

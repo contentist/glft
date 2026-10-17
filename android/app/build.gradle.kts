@@ -26,7 +26,10 @@ android {
             isMinifyEnabled = false
         }
     }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     packaging { jniLibs { useLegacyPackaging = false } }
 }
 
@@ -88,4 +91,8 @@ dependencies {
     implementation(libs.compose.ui.tooling.preview)
     implementation(libs.kotlinx.coroutines.android)
     implementation("${libs.jna.get()}@aar")
+    implementation(libs.camerax.camera2)
+    implementation(libs.camerax.lifecycle)
+    implementation(libs.camerax.view)
+    implementation(libs.zxing.cpp)
 }

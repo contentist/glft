@@ -25,18 +25,36 @@ pub struct Partial {
 }
 
 pub trait ReceiveStorage: Send + Sync {
-    /// Whether something already exists at `rel`, for `Album (2)` naming.
+    /// Whether something already exists at `rel`, for `Album (2)` naming. Counts files
+    /// still arriving, if the platform shows them under their final name.
     fn exists(&self, rel: &str) -> io::Result<bool>;
+    /// Whether a finished, published file is at `rel`. Files still arriving never count:
+    /// resuming relies on this to tell a file finished just before an interruption from
+    /// one that is only partly here.
+    fn published(&self, rel: &str) -> io::Result<bool>;
     /// Creates the folder `rel` and any parents.
     fn make_dir(&self, rel: &str) -> io::Result<()>;
     /// Creates an empty, not-yet-visible file that will become `rel`.
     fn create_partial(&self, rel: &str) -> io::Result<Partial>;
+    /// Opens a partial left by an interrupted transfer, if it is still there. `token` is
+    /// the one [`Self::create_partial`] returned.
+    fn reopen_partial(&self, rel: &str, token: &str) -> io::Result<Option<Partial>>;
     /// Publishes a verified partial under its name. Must not replace an existing file.
-    fn finish(&self, partial: Partial) -> io::Result<()>;
+    /// `hash` is its BLAKE3 fingerprint, kept as a verified mark where the platform can.
+    fn finish(&self, partial: Partial, hash: &[u8; 32]) -> io::Result<()>;
     /// Removes a partial that will not be finished.
     fn discard(&self, partial: Partial) -> io::Result<()>;
+    /// Removes a partial left by a transfer abandoned long ago, known only by its token.
+    fn discard_abandoned(&self, token: &str) -> io::Result<()>;
     /// How the folder holding `rel` reads to a person: `~/Downloads/glft/Album`.
     fn describe(&self, rel: &str) -> String;
+}
+
+/// Extended attribute holding a received file's BLAKE3 fingerprint, hex.
+pub const VERIFIED_XATTR: &str = "user.glft.blake3";
+
+fn hex(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Plain files under a root folder. Partials sit next to their final place as
@@ -71,6 +89,11 @@ impl ReceiveStorage for FsStorage {
         }
     }
 
+    fn published(&self, rel: &str) -> io::Result<bool> {
+        // Partials have their own names here, so anything at `rel` is published.
+        self.exists(rel)
+    }
+
     fn make_dir(&self, rel: &str) -> io::Result<()> {
         fs::create_dir_all(self.path(rel))
     }
@@ -81,8 +104,22 @@ impl ReceiveStorage for FsStorage {
         Ok(Partial { file, rel: rel.to_string(), token: path.to_string_lossy().into_owned() })
     }
 
-    fn finish(&self, partial: Partial) -> io::Result<()> {
+    fn reopen_partial(&self, rel: &str, token: &str) -> io::Result<Option<Partial>> {
+        // Only a partial in the expected place is reused.
+        if Path::new(token) != self.partial_path(rel) {
+            return Ok(None);
+        }
+        match OpenOptions::new().read(true).write(true).open(token) {
+            Ok(file) => Ok(Some(Partial { file, rel: rel.to_string(), token: token.to_string() })),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn finish(&self, partial: Partial, hash: &[u8; 32]) -> io::Result<()> {
         partial.file.sync_all()?;
+        // The verified mark; filesystems without extended attributes simply go without.
+        let _ = xattr::set(&partial.token, VERIFIED_XATTR, hex(hash).as_bytes());
         let target = self.path(&partial.rel);
         // A hard link fails if the name is taken, so an existing file is never replaced.
         match fs::hard_link(&partial.token, &target) {
@@ -102,6 +139,14 @@ impl ReceiveStorage for FsStorage {
     fn discard(&self, partial: Partial) -> io::Result<()> {
         drop(partial.file);
         fs::remove_file(&partial.token)
+    }
+
+    fn discard_abandoned(&self, token: &str) -> io::Result<()> {
+        // Only ever a partial file of ours, inside the receive folder.
+        let path = Path::new(token);
+        let ours = path.starts_with(&self.root)
+            && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(crate::manifest::PARTIAL_SUFFIX));
+        if ours { fs::remove_file(path) } else { Ok(()) }
     }
 
     fn describe(&self, rel: &str) -> String {
@@ -129,12 +174,12 @@ mod tests {
         p.file.write_all(b"data").unwrap();
         assert!(dir.path().join("Album/.a.flac.glft-part").exists());
         assert!(!s.exists("Album/a.flac").unwrap());
-        s.finish(p).unwrap();
+        s.finish(p, &[1; 32]).unwrap();
         assert_eq!(fs::read(dir.path().join("Album/a.flac")).unwrap(), b"data");
         assert!(!dir.path().join("Album/.a.flac.glft-part").exists());
 
         let p = s.create_partial("Album/a.flac").unwrap();
-        assert!(s.finish(p).is_err(), "an existing file must not be replaced");
+        assert!(s.finish(p, &[1; 32]).is_err(), "an existing file must not be replaced");
         assert_eq!(fs::read(dir.path().join("Album/a.flac")).unwrap(), b"data");
     }
 }

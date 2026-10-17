@@ -24,6 +24,9 @@ class SafStorage(private val resolver: ContentResolver, private val tree: Uri) :
 
     override fun exists(rel: String): Boolean = guard { resolve(rel) != null }
 
+    // Partials are named ".name.glft-part", so a document under the final name is finished.
+    override fun published(rel: String): Boolean = exists(rel)
+
     @Synchronized
     override fun makeDir(rel: String) = guard {
         var path = ""
@@ -45,6 +48,10 @@ class SafStorage(private val resolver: ContentResolver, private val tree: Uri) :
             ?: throw IllegalStateException("could not create $rel")
         val pfd = resolver.openFileDescriptor(doc, "rw") ?: throw IllegalStateException("could not open $rel")
         OpenedPartial(pfd.detachFd(), doc.toString())
+    }
+
+    override fun reopenPartial(rel: String, token: String): OpenedPartial? = guard {
+        reopen(resolver, Uri.parse(token))?.let { OpenedPartial(it, token) }
     }
 
     override fun finish(rel: String, token: String) = guard {

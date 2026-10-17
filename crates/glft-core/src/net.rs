@@ -76,29 +76,65 @@ pub async fn bind_ephemeral(secret: SecretKey) -> Result<Endpoint, Error> {
     build(secret, 0).await
 }
 
-async fn build(secret: SecretKey, port: u16) -> Result<Endpoint, Error> {
-    // Refused outright (EPERM/EACCES) means the platform withholds network access from the
-    // app, e.g. GrapheneOS's Network permission; anything else is a plain bind failure.
-    let bind_err = |e: &dyn std::error::Error| {
-        let detail = chain(e);
-        let kind = if classify_unreachable(&detail) == ErrorKind::LocalNetworkBlocked {
-            ErrorKind::NetworkDenied
-        } else {
-            ErrorKind::BindFailed
-        };
-        Error::new(kind, detail)
+/// Binds a short-lived endpoint for pairing on any free port. It is not announced by
+/// mDNS (the code carries its addresses) and speaks only the pairing protocol.
+pub async fn bind_pairing(secret: SecretKey) -> Result<Endpoint, Error> {
+    builder(secret, 0, crate::pairing::PAIR_ALPN)
+        .map_err(|e| bind_err(&e))?
+        .bind()
+        .await
+        .map_err(|e| bind_err(&e))
+}
+
+/// How long a silent connection lasts. Keep-alives go every 5 s, so a pulled Wi-Fi
+/// shows up as a lost connection within this time, and resuming can start.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+// Refused outright (EPERM/EACCES) means the platform withholds network access from the
+// app, e.g. GrapheneOS's Network permission; anything else is a plain bind failure.
+fn bind_err(e: &dyn std::error::Error) -> Error {
+    let detail = chain(e);
+    let kind = if classify_unreachable(&detail) == ErrorKind::LocalNetworkBlocked {
+        ErrorKind::NetworkDenied
+    } else {
+        ErrorKind::BindFailed
     };
+    Error::new(kind, detail)
+}
+
+fn builder(secret: SecretKey, port: u16, alpn: &[u8]) -> Result<iroh::endpoint::Builder, iroh::endpoint::InvalidSocketAddr> {
+    let transport = iroh::endpoint::QuicTransportConfig::builder()
+        .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("15 s fits")))
+        .build();
     Endpoint::builder(presets::Minimal)
         .secret_key(secret)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![alpn.to_vec()])
+        .transport_config(transport)
         .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
-        .bind_addr((Ipv4Addr::UNSPECIFIED, port))
-        .map_err(|e| bind_err(&e))?
+        .bind_addr((Ipv4Addr::UNSPECIFIED, port))?
         .bind_addr_with_opts(
             SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
             BindOpts::default().set_is_required(false),
         )
+}
+
+/// Orders addresses by how likely they are the home network: 192.168/16, then 10/8,
+/// then 172.16/12 (where Docker and other bridges usually sit), then the rest.
+pub fn lan_rank(addr: &SocketAddr) -> u8 {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => match ip.octets() {
+            [192, 168, ..] => 0,
+            [10, ..] => 1,
+            [172, b, ..] if (16..32).contains(&b) => 2,
+            _ => 3,
+        },
+        _ => 4,
+    }
+}
+
+async fn build(secret: SecretKey, port: u16) -> Result<Endpoint, Error> {
+    builder(secret, port, ALPN)
         .map_err(|e| bind_err(&e))?
         .address_lookup(MdnsAddressLookup::builder().service_name(MDNS_SERVICE))
         .bind()

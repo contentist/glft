@@ -17,8 +17,15 @@ serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+n0-future.workspace = true
 directories.workspace = true
 walkdir.workspace = true
+serde_json.workspace = true
+data-encoding.workspace = true
+getrandom.workspace = true
+xattr.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+xattr.workspace = true

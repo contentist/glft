@@ -847,3 +847,60 @@ pub fn default_folder_name() -> String {
     "glft".into()
 }
 
+
+// ---------------------------------------------------------------- debug log
+
+/// Sends the core's and iroh's own logging (`tracing`) to Android's log, tag `glft-net`, so
+/// network problems can be followed over `adb logcat`. For debug builds; `filter` is a
+/// `RUST_LOG`-style filter such as `iroh=debug,glft_core=debug`.
+#[uniffi::export]
+pub fn enable_debug_log(filter: String) {
+    let filter = tracing_subscriber::EnvFilter::try_new(filter).unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(|| AndroidLog(Vec::new()))
+        .try_init();
+}
+
+/// One log record, written to Android's log when complete.
+struct AndroidLog(Vec<u8>);
+
+impl io::Write for AndroidLog {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for AndroidLog {
+    fn drop(&mut self) {
+        let text = String::from_utf8_lossy(&self.0);
+        android_log(text.trim_end());
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_log(text: &str) {
+    use std::ffi::{CString, c_char, c_int};
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int;
+    }
+    const DEBUG: c_int = 3;
+    let (Ok(tag), Ok(text)) = (CString::new("glft-net"), CString::new(text.replace('\0', " "))) else { return };
+    // SAFETY: both are valid NUL-terminated strings that outlive the call.
+    unsafe {
+        __android_log_write(DEBUG, tag.as_ptr(), text.as_ptr());
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn android_log(text: &str) {
+    eprintln!("{text}");
+}

@@ -266,6 +266,91 @@ async fn receiver_back_on_a_new_address_is_found_quickly() {
     assert!(tx_log.contains("Resuming:"), "{tx_log}");
 }
 
+/// Storage that hangs every file request during its first 10 seconds, so the sender sees an
+/// accepted transfer that makes no progress at all.
+struct HangsOnce {
+    inner: LikeMediaStore,
+    first: Mutex<Option<std::time::Instant>>,
+}
+
+impl ReceiveStorage for HangsOnce {
+    fn exists(&self, rel: &str) -> std::io::Result<bool> {
+        self.inner.exists(rel)
+    }
+    fn published(&self, rel: &str) -> std::io::Result<bool> {
+        self.inner.published(rel)
+    }
+    fn make_dir(&self, rel: &str) -> std::io::Result<()> {
+        self.inner.make_dir(rel)
+    }
+    fn create_partial(&self, rel: &str) -> std::io::Result<Partial> {
+        let first = *self.first.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+        if let Some(left) = Duration::from_secs(10).checked_sub(first.elapsed()) {
+            std::thread::sleep(left);
+        }
+        self.inner.create_partial(rel)
+    }
+    fn reopen_partial(&self, rel: &str, token: &str) -> std::io::Result<Option<Partial>> {
+        self.inner.reopen_partial(rel, token)
+    }
+    fn finish(&self, partial: Partial, hash: &[u8; 32]) -> std::io::Result<()> {
+        self.inner.finish(partial, hash)
+    }
+    fn discard(&self, partial: Partial) -> std::io::Result<()> {
+        self.inner.discard(partial)
+    }
+    fn discard_abandoned(&self, token: &str) -> std::io::Result<()> {
+        self.inner.discard_abandoned(token)
+    }
+    fn describe(&self, rel: &str) -> String {
+        self.inner.describe(rel)
+    }
+}
+
+/// An accepted transfer that stops moving reconnects after a few seconds rather than waiting
+/// for the connection to time out, and still arrives complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_that_stops_moving_reconnects_and_finishes() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let album = make_album(src.path());
+    let rx_key = SecretKey::generate();
+    let (rx_events, _, _) = watched(|_| false);
+    let endpoint = net::bind(rx_key.clone(), Some(0), &rx_events).await.unwrap();
+    let port = endpoint.bound_sockets()[0].port();
+    let storage = HangsOnce {
+        inner: LikeMediaStore { fs: FsStorage::new(dest.path().to_path_buf()).unwrap(), root: dest.path().to_path_buf() },
+        first: Mutex::new(None),
+    };
+    let opts = Arc::new(ReceiveOptions {
+        storage: Arc::new(storage),
+        decide: counting_yes(Arc::new(AtomicUsize::new(0))),
+        authorize: Arc::new(|_| true),
+        records: Records::new(state.path()),
+        seen: None,
+        once: false,
+    });
+    let ep = endpoint.clone();
+    let rx = tokio::spawn(async move {
+        let _ = transfer::serve(&ep, opts, &rx_events).await;
+    });
+
+    let (tx_events, tx_log, _) = watched(|_| false);
+    let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
+    let peer = net::peer_addr(rx_key.public(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+    let delivered = tokio::time::timeout(Duration::from_secs(60), transfer::send(&tx, peer, vec![album], &tx_events))
+        .await
+        .expect("finishes")
+        .unwrap();
+    rx.abort();
+
+    assert_eq!(delivered.totals.files, 6);
+    same_tree(&src.path().join("Album"), &dest.path().join("Album"));
+    let tx_log = tx_log.lock().unwrap().join("\n");
+    assert!(tx_log.contains("waiting to resume"), "the stalled connection was given up: {tx_log}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sender_restart_resumes_the_same_files() {
     let src = tempfile::tempdir().unwrap();

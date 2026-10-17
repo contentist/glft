@@ -188,6 +188,8 @@ class GlftApp : Application() {
     override fun onCreate() {
         super.onCreate()
         Notifications.createChannels(this)
+        // Debug builds log the network layer too, tag glft-net (adb logcat -s glft-net).
+        if (BuildConfig.DEBUG) uniffi.glft_ffi.enableDebugLog("warn,glft_core=debug,iroh::endpoint=debug,noq_udp=debug")
         val prefs = getSharedPreferences("glft", Context.MODE_PRIVATE)
         val tree = prefs.getString("tree", null)
         val label = prefs.getString("treeLabel", null)

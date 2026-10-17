@@ -1262,6 +1262,7 @@ dependencies = [
  "glft-core",
  "iroh",
  "tokio",
+ "tracing-subscriber",
  "uniffi",
 ]
 

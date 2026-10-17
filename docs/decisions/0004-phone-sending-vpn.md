@@ -45,12 +45,27 @@ Date: 2026-10-17. Status: decided (Day 4), two questions open (end of this recor
   the better route by itself, and its settings don't allow turning that off. A per-send
   choice therefore only does something when the devices are on different networks, which
   the automatic route already handles, so the choice was removed.
-- **Mixing routes in one connection stalls it under lockdown.** With lockdown on, the first
-  connection over Yggdrasil carried the offer and then no data for about 35 seconds, until
-  glft reconnected; the reconnect then finished at once. Without lockdown, a connection
-  made over Yggdrasil only (an endpoint with no local network lookup) finished 400 KB in
-  0.1 s. The likely cause is iroh trying the laptop's Wi-Fi addresses, which lockdown
-  refuses; it is not proven.
+- **Under lockdown every send stalled for about 35 seconds before resuming** (found and worked around
+  on 2026-10-17). The cause is in iroh, with Android's VPN tunnel as
+  the trigger, shown by the phone's network log (now available in debug builds, tag
+  `glft-net`), a packet capture on the laptop's Yggdrasil interface, and iroh's source:
+  1. To send fast, QUIC hands the system several packets in one call (UDP segmentation
+     offload, GSO). Android's VPN tunnel (here Yggdrasil's) refuses that: the first batched
+     send fails with `EIO` ("I/O error (os error 5); halting segmentation offload").
+  2. noq-udp then switches batching off for the socket, but iroh stores each connection's
+     batch size once, when the connection is set up (`TransportsSender::max_transmit_segments`
+     in `create_sender`), so the running connection keeps building batches. Every batch
+     fails, and the errors are logged only once a minute. Only single small packets get
+     through: the capture shows one 35-byte packet from the phone and nothing else for 35 s.
+  3. QUIC gives up on the connection, glft reconnects, and the new connection starts
+     without batching, so it finishes at once.
+  It shows only under lockdown because otherwise iroh moves the transfer to Wi-Fi, where
+  batching works. Ruled out on the way: Yggdrasil losing packets (it drops part of a raw
+  burst but carries 1200-byte pings straight after), packet size, and the brief Wi-Fi
+  attempt before the mesh. **Workaround in glft:** an accepted transfer that makes no
+  progress for 8 seconds reconnects (`transfer::STALL`). Measured under lockdown: verified in
+  9.5 s instead of about 39. The proper fix belongs in iroh (read the batch size each time);
+  not yet reported upstream.
 - **Turning off Android's "Always-on VPN" also stopped the Yggdrasil app's VPN.** glft
   greys out mesh sending when no VPN is running and says so.
 - **Before Day 4 the phone had never connected to the laptop;** the laptop always dialled.
@@ -67,7 +82,7 @@ Date: 2026-10-17. Status: decided (Day 4), two questions open (end of this recor
 | 150 MB, Wi-Fi | 7.8 MB/s |
 
 ## Open
-- **The stall under lockdown.** Needs iroh's own logging on the phone to prove the cause.
+- **Reporting the batching bug to iroh,** with the evidence above, when the owner is ready.
 - **Yggdrasil away from home.** With the phone's Wi-Fi off (mobile data only), the
   Yggdrasil app did not reconnect to its public peer within several minutes, although the
   phone could reach the peer's port. So phone-to-laptop over Yggdrasil from another network

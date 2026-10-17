@@ -111,15 +111,16 @@ async fn folder_arrives_verified_with_structure() {
     fs::create_dir(dest.path().join("Album")).unwrap();
     fs::write(src.path().join("notes.txt"), b"hello").unwrap();
 
-    let (_rx_ep, addr, rx_task, rx_log) = receiver(dest.path(), answer(true)).await;
+    let (rx_ep, addr, rx_task, rx_log) = receiver(dest.path(), answer(true)).await;
     let (events, tx_log) = collecting();
     let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
-    let delivered = transfer::send(&tx, addr.clone(), vec![album.clone(), src.path().join("notes.txt")], &events).await.unwrap();
+    let delivered = transfer::send(&tx, addr, vec![album.clone(), src.path().join("notes.txt")], &events).await.unwrap();
     rx_task.await.unwrap();
 
     assert_eq!(delivered.totals.files, 5);
     let used = delivered.addr.expect("the address the transfer used");
-    assert!(addr.ip_addrs().any(|a| a.port() == used.port()), "{used} is one of the receiver's addresses");
+    // The receiver listens on one port for IPv4 and another for IPv6; either may carry it.
+    assert!(rx_ep.bound_sockets().iter().any(|a| a.port() == used.port()), "{used} is one of the receiver's addresses");
     assert_eq!(tree_hashes(&album), tree_hashes(&dest.path().join("Album (2)")));
     assert_eq!(fs::read(dest.path().join("notes.txt")).unwrap(), b"hello");
     let leftovers: Vec<_> = walkdir(dest.path()).into_iter().filter(|p| p.to_string_lossy().ends_with(".glft-part")).collect();

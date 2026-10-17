@@ -53,6 +53,14 @@ use crate::{
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the local network gets on its own before mesh addresses are tried as well.
 const LOCAL_FIRST: Duration = Duration::from_secs(4);
+/// How long an accepted transfer may go without any progress before it reconnects.
+///
+/// A connection can stop carrying data while it still looks alive: on Android, a VPN tunnel
+/// (such as Yggdrasil's) refuses the batched sends iroh starts each connection with, and the
+/// connection keeps trying them until QUIC gives up on it about 35 seconds later. A new
+/// connection learns not to batch, so reconnecting early ends the stall. Anything else
+/// that hangs a connection is caught the same way; resuming loses nothing.
+const STALL: Duration = Duration::from_secs(8);
 /// Verified data is gathered into writes of this size.
 const WRITE_BUFFER: usize = 4 * 1024 * 1024;
 /// Files fetched at the same time.
@@ -389,7 +397,14 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
     }
 
     let server = tokio::spawn(serve_requests(conn.clone(), outgoing.clone(), s.sent.clone(), s.progress.clone(), events.clone()));
-    let done = proto::read::<Done>(&mut ctl_recv).await;
+    s.progress.touch();
+    let done = tokio::select! {
+        done = proto::read::<Done>(&mut ctl_recv) => done,
+        () = s.progress.stalled(STALL) => {
+            tracing::debug!(peer = %s.label, "no progress for {STALL:?}; reconnecting");
+            Err(Error::new(ErrorKind::ConnectionLost, format!("no progress for {} seconds", STALL.as_secs())))
+        }
+    };
     server.abort();
     drop(route_watch);
     // Remember a private IPv4 address if the connection had one, or else the one dialled
@@ -426,6 +441,7 @@ async fn serve_requests(conn: Connection, outgoing: Arc<Outgoing>, sent: Arc<Mut
         tokio::spawn(async move {
             match serve_file(send, recv, &outgoing, &progress, &events).await {
                 Ok(index) => {
+                    progress.touch();
                     sent.lock().unwrap().insert(index);
                 }
                 // A lost connection is reported once by the transfer, not per file.
@@ -480,12 +496,30 @@ struct SendProgress {
     done: AtomicU64,
     total: u64,
     last: Mutex<Option<Instant>>,
+    /// When something last moved: bytes written to the connection, or a file confirmed.
+    active: Mutex<Instant>,
     events: EventSink,
 }
 
 impl SendProgress {
     fn new(total: u64, events: EventSink) -> Self {
-        Self { done: AtomicU64::new(0), total, last: Mutex::new(None), events }
+        Self { done: AtomicU64::new(0), total, last: Mutex::new(None), active: Mutex::new(Instant::now()), events }
+    }
+
+    /// Notes that the transfer moved forward.
+    fn touch(&self) {
+        *self.active.lock().unwrap() = Instant::now();
+    }
+
+    /// Resolves once nothing has moved for `limit`.
+    async fn stalled(&self, limit: Duration) {
+        loop {
+            let idle = self.active.lock().unwrap().elapsed();
+            if idle >= limit {
+                return;
+            }
+            tokio::time::sleep(limit - idle).await;
+        }
     }
 
     /// Starts counting from what the receiver already has, and reports it.
@@ -496,6 +530,7 @@ impl SendProgress {
     }
 
     fn add(&self, n: u64) {
+        self.touch();
         let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
         let mut last = self.last.lock().unwrap();
         if last.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {

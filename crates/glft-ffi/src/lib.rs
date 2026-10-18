@@ -598,6 +598,7 @@ impl Node {
         let secret = self.secret.clone();
         let peer = net::peer_addr(id, &addrs);
         let files: Arc<dyn SourceFiles> = Arc::new(ForeignSource(source));
+        let name = device.name.clone();
         let result = runtime().block_on(async move {
             let (endpoint, temporary) = match (route, receiving) {
                 (Route::Mesh, _) => (net::bind_without_discovery(secret).await?, true),
@@ -605,7 +606,7 @@ impl Node {
                 (_, None) => (net::bind_ephemeral(secret).await?, true),
             };
             let result = tokio::select! {
-                r = transfer::send_items(&endpoint, peer, items, files, &events) => r,
+                r = transfer::send_items(&endpoint, peer, Some(&name), items, files, &events) => r,
                 _ = cancelled => Err(Error::new(ErrorKind::Cancelled, "the send was cancelled")),
             };
             if temporary {
@@ -740,7 +741,7 @@ fn explain_network(e: Error) -> Error {
 fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
     Arc::new(move |event: Event| {
         let at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-        if let Event::Progress { done, total } = event {
+        if let Event::Progress { done, total, .. } = event {
             listener.on_progress(done, total);
             return;
         }

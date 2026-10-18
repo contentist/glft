@@ -8,7 +8,6 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
-    time::Duration,
 };
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -19,8 +18,7 @@ use glft_core::{
     identity, paths,
     storage::VERIFIED_XATTR,
 };
-use glft_engine::{Conn, ErrorInfo, LogLine, Reply, Request};
-use tokio::net::UnixStream;
+use glft_engine::{ErrorInfo, LogLine, Reply, Request, client};
 
 #[derive(Parser)]
 #[command(name = "glft", version, about = "Send files directly between your devices, verified.")]
@@ -87,6 +85,8 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+    /// Stop a send, by the number `glft status` shows.
+    Cancel { send: u64 },
     /// List offers waiting for an answer.
     Offers,
     /// Accept an offer (the only one waiting, or the one numbered).
@@ -145,7 +145,11 @@ async fn run(command: Command) -> Result<ExitCode> {
                         None => println!("Receiving: off (`glft receive on` switches it on)"),
                     }
                     for s in &st.sending {
-                        println!("Sending: {s}");
+                        println!("Sending {}: {s} (`glft cancel {}` stops it)", s.id, s.id);
+                    }
+                    for i in &st.incoming {
+                        let pct = (i.done * 100).checked_div(i.total).unwrap_or(0);
+                        println!("Receiving from {}: {} of {} ({pct}%)", i.peer, human_bytes(i.done), human_bytes(i.total));
                     }
                     if st.offers > 0 {
                         println!("Offers waiting: {} (`glft offers`)", st.offers);
@@ -175,7 +179,7 @@ async fn run(command: Command) -> Result<ExitCode> {
                         println!("No paired devices. `glft pair` shows a code to scan with the phone.");
                     }
                     for d in devices {
-                        let kind = if d.remembered { "remembered" } else { "this session only" };
+                        let kind = if d.remembered { "remembered" } else { "until you log out" };
                         let accept = if d.device.auto_accept { "accepts without asking" } else { "asks first" };
                         let seen = d.device.last_seen.map(|t| format!(", last transfer {}", local_time(t))).unwrap_or_default();
                         println!("{:<24} {}  {kind}, {accept}{seen}", d.device.name, d.device.short_id());
@@ -191,6 +195,7 @@ async fn run(command: Command) -> Result<ExitCode> {
             let paths = paths.into_iter().map(|p| std::path::absolute(&p).unwrap_or(p)).collect();
             Session::open(Request::Send { device, addrs, paths, detach }).await?.drain().await?;
         }
+        Command::Cancel { send } => Session::open(Request::CancelSend { id: send }).await?.drain().await?,
         Command::Offers => {
             for o in offers().await? {
                 println!("{:>3}  {} offers {}, to be saved to {}", o.id, o.peer, o.summary, o.dest);
@@ -201,11 +206,12 @@ async fn run(command: Command) -> Result<ExitCode> {
         Command::Verify { paths } => return Ok(verify(&paths)),
         Command::Setup => {
             install_units(true)?;
+            install_desktop()?;
         }
         Command::Restart => {
             if let Ok(s) = Session::try_open(Request::Quit).await {
                 let _ = s.finish().await;
-                wait_for_exit().await;
+                client::wait_for_exit().await;
             }
             let mut s = Session::open(Request::Status).await?;
             while let Some(reply) = s.next().await? {
@@ -274,7 +280,7 @@ async fn pair(request: Request) -> Result<()> {
             }
             Reply::PairPeer { name, .. } => {
                 let (remember, auto_accept) = tokio::task::spawn_blocking(move || ask_remember(&name)).await.unwrap_or((Remember::No, false));
-                s.conn.send(&Request::PairAnswer { remember, auto_accept }).await.map_err(lost_engine)?;
+                s.send(&Request::PairAnswer { remember, auto_accept }).await?;
             }
             _ => {}
         }
@@ -380,74 +386,52 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
 
 // ---------------------------------------------------------------- talking to the engine
 
+/// A request to the engine, printing log lines and progress as they come.
 struct Session {
-    conn: Conn,
+    inner: client::Session,
 }
 
 impl Session {
     /// Sends `request`, starting the engine first if it is not running.
     async fn open(request: Request) -> Result<Self> {
-        let stream = match connect().await {
-            Ok(s) => s,
-            Err(_) => {
-                start_engine()?;
-                let mut tries = 0;
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    match connect().await {
-                        Ok(s) => break s,
-                        Err(e) if tries > 40 => return Err(local(Error::new(ErrorKind::EngineNotRunning, e.to_string()))),
-                        Err(_) => tries += 1,
-                    }
-                }
-            }
-        };
-        Self::start(stream, request).await
+        let inner = client::Session::open(request, announce_setup).await?;
+        Ok(Self::checked(inner))
     }
 
     /// Like [`Self::open`], but never starts the engine.
     async fn try_open(request: Request) -> Result<Self> {
-        let stream = connect().await.map_err(|e| local(Error::new(ErrorKind::EngineNotRunning, e.to_string())))?;
-        Self::start(stream, request).await
+        Ok(Self::checked(client::Session::try_open(request).await?))
     }
 
-    async fn start(stream: UnixStream, request: Request) -> Result<Self> {
-        let mut conn = Conn::new(stream);
-        conn.send(&request).await.map_err(lost_engine)?;
-        // The heartbeat: a running engine acknowledges at once.
-        match tokio::time::timeout(glft_engine::HEARTBEAT, conn.recv::<Reply>()).await {
-            Ok(Ok(Some(Reply::Ack { version, .. }))) => {
-                if let Some(installed) = engine_build_id()
-                    && installed != version
-                {
-                    out().line("Note: the running engine is older than the installed glftd; `glft restart` switches to it.");
-                }
-                Ok(Self { conn })
-            }
-            Ok(_) => Err(local(Error::new(ErrorKind::EngineNotAnswering, "it closed the connection without answering"))),
-            Err(_) => Err(local(Error::new(ErrorKind::EngineNotAnswering, "no answer within 2 seconds"))),
+    fn checked(inner: client::Session) -> Self {
+        if client::Session::outdated() {
+            out().line("Note: the running engine is older than the installed glftd; `glft restart` switches to it.");
         }
+        Self { inner }
     }
 
     /// The next reply that is not a log line or progress (those are printed), or `None`
     /// when the request is done.
     async fn next(&mut self) -> Result<Option<Reply>> {
         loop {
-            match self.conn.recv::<Reply>().await.map_err(lost_engine)? {
-                None => return Err(lost_engine("the connection closed")),
-                Some(Reply::Line(l)) => out().log(&l),
-                Some(Reply::Progress { done, total, sending }) => out().progress(done, total, sending),
-                Some(Reply::Done) => {
+            match self.inner.next().await {
+                Ok(None) => {
                     out().clear();
                     return Ok(None);
                 }
-                Some(Reply::Failed(e)) => return Err(e),
-                Some(Reply::Offer(o)) => {
+                Ok(Some(Reply::Line(l))) => out().log(&l),
+                Ok(Some(Reply::Progress { done, total, sending, .. })) => out().progress(done, total, sending),
+                Ok(Some(Reply::Offer(o))) => {
                     out().line(&format!("{} offers {}; `glft accept {}` or `glft decline {}`", o.peer, o.summary, o.id, o.id));
                 }
-                Some(other) => return Ok(Some(other)),
+                Ok(Some(other)) => return Ok(Some(other)),
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    async fn send(&mut self, request: &Request) -> Result<()> {
+        self.inner.send(request).await
     }
 
     async fn drain(&mut self) -> Result<()> {
@@ -460,97 +444,60 @@ impl Session {
     }
 }
 
-fn lost_engine(e: impl std::fmt::Display) -> ErrorInfo {
-    local(Error::new(ErrorKind::EngineNotAnswering, e.to_string()))
+fn announce_setup(dir: &Path) {
+    out().line(&format!(
+        "Set up glft's engine as a systemd user service (glft.socket, glft.service in {}). It starts when a glft command needs it and listens on the network only while receiving is on.",
+        tilde(dir)
+    ));
 }
 
-async fn connect() -> std::io::Result<UnixStream> {
-    let path = glft_engine::socket_path().map_err(|e| std::io::Error::other(e.detail))?;
-    UnixStream::connect(path).await
-}
-
-async fn wait_for_exit() {
-    for _ in 0..30 {
-        if connect().await.is_err() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-fn engine_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    exe.parent().map(|d| d.join("glftd")).unwrap_or_else(|| PathBuf::from("glftd"))
-}
-
-/// The build id `glftd` on disk would report, to spot a running engine that is older.
-fn engine_build_id() -> Option<String> {
-    let mtime = std::fs::metadata(engine_path()).ok()?.modified().ok()?;
-    let secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some(format!("{} {secs}", env!("CARGO_PKG_VERSION")))
-}
-
-fn systemd_user_available() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "show-environment"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Starts the engine: through systemd's socket when it can, else as a plain background
-/// process (and always so when GLFT_RUNTIME_DIR points at a private socket).
-fn start_engine() -> Result<()> {
-    if std::env::var_os(glft_engine::RUNTIME_DIR_ENV).is_none() && systemd_user_available() {
-        install_units(false)?;
-        let started = std::process::Command::new("systemctl").args(["--user", "start", "glft.socket"]).status();
-        if started.is_ok_and(|s| s.success()) {
-            return Ok(());
-        }
-    }
-    let data_dir = paths::data_dir().map_err(local)?;
-    std::fs::create_dir_all(&data_dir).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &data_dir, e)))?;
-    let log_path = data_dir.join("engine.log");
-    let log = std::fs::OpenOptions::new().create(true).append(true).open(&log_path).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &log_path, e)))?;
-    let err_log = log.try_clone().map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &log_path, e)))?;
-    use std::os::unix::process::CommandExt;
-    std::process::Command::new(engine_path())
-        .stdin(std::process::Stdio::null())
-        .stdout(log)
-        .stderr(err_log)
-        // Its own process group, so Ctrl-C in this terminal does not stop it.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| local(Error::new(ErrorKind::EngineNotRunning, format!("{}: {e}", engine_path().display()))))?;
-    Ok(())
-}
-
-/// Writes the systemd user units if they are missing or point at another `glftd`.
+/// `glft setup`: the systemd units.
 fn install_units(verbose: bool) -> Result<()> {
     let dir = glft_engine::unit_dir().map_err(local)?;
-    let engine = std::fs::canonicalize(engine_path()).unwrap_or_else(|_| engine_path());
-    let units = [("glft.socket", glft_engine::SOCKET_UNIT.to_string()), ("glft.service", glft_engine::service_unit(&engine))];
-    let mut changed = false;
-    for (name, content) in &units {
-        let path = dir.join(name);
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(content.as_str()) {
-            std::fs::create_dir_all(&dir).map_err(|e| local(Error::io(ErrorKind::EngineNotRunning, &dir, e)))?;
-            std::fs::write(&path, content).map_err(|e| local(Error::io(ErrorKind::EngineNotRunning, &path, e)))?;
-            changed = true;
-        }
-    }
-    if changed {
-        let systemctl = |args: &[&str]| std::process::Command::new("systemctl").arg("--user").args(args).status();
-        let _ = systemctl(&["daemon-reload"]);
-        let _ = systemctl(&["enable", "glft.socket"]);
-        out().line(&format!(
-            "Set up glft's engine as a systemd user service (glft.socket, glft.service in {}). It starts when a glft command needs it and listens on the network only while receiving is on.",
-            tilde(&dir)
-        ));
+    if client::install_units()? {
+        announce_setup(&dir);
     } else if verbose {
         out().line(&format!("glft's engine is set up (units in {})", tilde(&dir)));
     }
+    Ok(())
+}
+
+/// The window's menu entry, icon and Nemo's "Send to phone…", for this user, when
+/// `glft-window` is installed next to `glft`. Packages install them system-wide instead.
+fn install_desktop() -> Result<()> {
+    let window = client::sibling("glft-window");
+    let Ok(window) = std::fs::canonicalize(&window) else {
+        out().line("The glft window isn't installed next to glft, so no menu entry or Nemo action was set up.");
+        return Ok(());
+    };
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .ok_or_else(|| local(Error::new(ErrorKind::NoHomeDir, "neither XDG_DATA_HOME nor HOME is set")))?;
+    let exe = window.display().to_string();
+    let exe = if exe.contains(' ') { format!("\"{exe}\"") } else { exe };
+    let exec = |template: &str| template.replace("Exec=glft-window", &format!("Exec={exe}"));
+    let files = [
+        ("applications/io.github.contentist.glft.desktop", exec(include_str!("../../../contrib/desktop/io.github.contentist.glft.desktop"))),
+        ("icons/hicolor/scalable/apps/io.github.contentist.glft.svg", include_str!("../../../contrib/desktop/io.github.contentist.glft.svg").to_string()),
+        ("nemo/actions/glft-send.nemo_action", exec(include_str!("../../../contrib/nemo/glft-send.nemo_action"))),
+    ];
+    for (rel, content) in &files {
+        let path = data.join(rel);
+        if std::fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
+            continue;
+        }
+        let dir = path.parent().expect("has a folder");
+        std::fs::create_dir_all(dir).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, dir, e)))?;
+        std::fs::write(&path, content).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &path, e)))?;
+        out().line(&format!("Installed {}", tilde(&path)));
+    }
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(data.join("applications"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    out().line("glft is in the menu, and Nemo's right-click menu has \"Send to phone…\" (open a new Nemo window to see it).");
     Ok(())
 }
 

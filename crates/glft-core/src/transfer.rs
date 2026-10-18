@@ -107,18 +107,25 @@ pub async fn prepare_items(items: Vec<manifest::Item>, files: Arc<dyn manifest::
 pub async fn send_items(
     endpoint: &Endpoint,
     peer: EndpointAddr,
+    name: Option<&str>,
     items: Vec<manifest::Item>,
     files: Arc<dyn manifest::SourceFiles>,
     events: &EventSink,
 ) -> Result<Delivered, Error> {
     let outgoing = prepare_items(items, files, events).await?;
-    deliver(endpoint, peer, outgoing, events).await
+    deliver(endpoint, peer, name, outgoing, events).await
 }
 
 /// Sends `paths` to `peer` and returns what was delivered.
 pub async fn send(endpoint: &Endpoint, peer: EndpointAddr, paths: Vec<PathBuf>, events: &EventSink) -> Result<Delivered, Error> {
+    send_to(endpoint, peer, None, paths, events).await
+}
+
+/// Like [`send`], naming the peer in events by `name` (a paired device's name) until it
+/// tells its own.
+pub async fn send_to(endpoint: &Endpoint, peer: EndpointAddr, name: Option<&str>, paths: Vec<PathBuf>, events: &EventSink) -> Result<Delivered, Error> {
     let outgoing = prepare(paths, events).await?;
-    deliver(endpoint, peer, outgoing, events).await
+    deliver(endpoint, peer, name, outgoing, events).await
 }
 
 /// Errors after which an accepted transfer is worth trying again.
@@ -172,11 +179,12 @@ fn watch_route(conn: Connection, peer: String, route: Arc<Mutex<Option<&'static 
 /// While no connection is up, the local network lookup is watched as well: a receiver that
 /// comes back on a new address (a phone after Wi-Fi reconnects) is dialled as soon as it
 /// announces itself, instead of after the attempt on its old address times out.
-pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, outgoing: Arc<Outgoing>, events: &EventSink) -> Result<Delivered, Error> {
+pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, name: Option<&str>, outgoing: Arc<Outgoing>, events: &EventSink) -> Result<Delivered, Error> {
     let totals = outgoing.totals();
     let reached = Arc::new(AtomicBool::new(false));
     let mut s = SendState {
-        label: short_id(&peer.id),
+        label: name.map(|n| format!("\"{n}\"")).unwrap_or_else(|| short_id(&peer.id)),
+        told_connecting: false,
         accepted: false,
         connected: false,
         reached: reached.clone(),
@@ -282,6 +290,8 @@ async fn new_addrs(endpoint: &Endpoint, peer: &EndpointAddr) -> EndpointAddr {
 
 struct SendState {
     label: String,
+    /// "Connecting to …" was said; redialling a new address doesn't say it again.
+    told_connecting: bool,
     /// The receiver accepted at least once, so this transfer is now worth resuming.
     accepted: bool,
     /// This attempt got as far as an answer.
@@ -303,7 +313,8 @@ struct SendState {
 
 async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoing>, events: &EventSink, s: &mut SendState) -> Result<(), Error> {
     let totals = outgoing.totals();
-    if !s.accepted {
+    if !s.accepted && !s.told_connecting {
+        s.told_connecting = true;
         events(Event::Connecting { peer: s.label.clone() });
     }
     let dialled_lan = peer.ip_addrs().copied().filter(|a| net::lan_rank(a) < 3).min_by_key(net::lan_rank);
@@ -804,7 +815,7 @@ async fn receive_offer(
     // Timed from here, so the time the person took to decide is not counted.
     let started = Instant::now();
     let renames = live.renames();
-    let progress = Progress { done: AtomicU64::new(0), total: totals.bytes, events: events.clone() };
+    let progress = Progress { peer: label.clone(), done: AtomicU64::new(0), total: totals.bytes, events: events.clone() };
     let job = Arc::new(Job {
         conn: conn.clone(),
         storage: opts.storage.clone(),
@@ -855,6 +866,7 @@ async fn receive_offer(
 
 /// Bytes verified in the current transfer, reported at checkpoints and file ends.
 struct Progress {
+    peer: String,
     done: AtomicU64,
     total: u64,
     events: EventSink,
@@ -871,7 +883,7 @@ impl Progress {
 
     fn report(&self, n: u64) {
         let done = self.done.fetch_add(n, Ordering::Relaxed) + n;
-        (self.events)(Event::Progress { done, total: self.total });
+        (self.events)(Event::Progress { peer: self.peer.clone(), done, total: self.total });
     }
 }
 

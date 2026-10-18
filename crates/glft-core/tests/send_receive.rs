@@ -260,7 +260,7 @@ async fn items_without_paths_arrive_like_a_path_send() {
     });
     let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
     let outgoing = transfer::prepare_items(items, files, &events).await.unwrap();
-    let delivered = transfer::deliver(&tx, addr, outgoing, &events).await.unwrap();
+    let delivered = transfer::deliver(&tx, addr, None, outgoing, &events).await.unwrap();
     rx_task.await.unwrap();
 
     assert_eq!(delivered.totals.files, 5);

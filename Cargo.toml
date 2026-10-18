@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/glft-core", "crates/glft-cli", "crates/glft-engine", "crates/glft-ffi"]
+members = ["crates/glft-core", "crates/glft-cli", "crates/glft-engine", "crates/glft-ffi", "crates/glft-gtk"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,6 +37,7 @@ xattr = { version = "1", default-features = false }
 qrcode = { version = "0.14", default-features = false }
 notify-rust = { version = "4", default-features = false, features = ["z-with-tokio"] }
 libc = "0.2"
+ksni = "0.3"
 
 [profile.release]
 codegen-units = 1

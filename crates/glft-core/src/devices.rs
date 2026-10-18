@@ -155,6 +155,11 @@ impl DeviceStore {
     }
 
     /// Remembered devices first, then session pairings, each with whether it is remembered.
+    /// Whether any pairing is "just this time", which lasts only while this store does.
+    pub fn has_session_pairings(&self) -> bool {
+        !self.session.is_empty()
+    }
+
     pub fn list(&self) -> Vec<(Device, bool)> {
         let remembered = self.remembered.iter().map(|d| (d.clone(), true));
         remembered.chain(self.session.iter().map(|d| (d.clone(), false))).collect()

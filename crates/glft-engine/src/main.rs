@@ -4,6 +4,7 @@
 //! switched on, which a desktop notification then shows (design rule 6).
 
 mod notify;
+mod tray;
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -13,9 +14,9 @@ use std::{
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use glft_core::{
@@ -29,15 +30,31 @@ use glft_core::{
     storage::FsStorage,
     transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions, Seen},
 };
-use glft_engine::{Conn, DeviceInfo, ErrorInfo, LogLine, OfferInfo, Receiving, Reply, Request, Status, read_line, write_line};
+use glft_engine::{Conn, DeviceInfo, ErrorInfo, Incoming, LogLine, OfferInfo, PING_LIMIT, Receiving, Reply, Request, SendInfo, Status, read_line, write_line};
 use iroh::{Endpoint, SecretKey};
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{broadcast, mpsc, oneshot},
-    task::JoinHandle,
+    sync::{broadcast, mpsc, oneshot, watch},
+    task::{AbortHandle, JoinHandle},
 };
 
 const RECENT_LINES: usize = 500;
+
+/// With nothing to do for this long (no client connected, receiving off, no send, no
+/// offer), the engine exits; the next client starts it again. Overridden in seconds by
+/// `GLFT_IDLE_SECS` (0: never).
+const IDLE_LIMIT: Duration = Duration::from_secs(60);
+
+/// An arriving transfer that reports no progress for this long is no longer listed.
+const INCOMING_STALE: Duration = Duration::from_secs(20);
+
+fn idle_limit() -> Option<Duration> {
+    match std::env::var("GLFT_IDLE_SECS").ok().and_then(|s| s.parse::<f64>().ok()) {
+        Some(s) if s <= 0.0 => None,
+        Some(s) => Some(Duration::from_secs_f64(s)),
+        None => Some(IDLE_LIMIT),
+    }
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -74,6 +91,9 @@ async fn run() -> Result<(), Error> {
         next_offer: AtomicU64::new(1),
         sending: Default::default(),
         next_send: AtomicU64::new(1),
+        incoming: Default::default(),
+        changed: watch::channel(0).0,
+        clients: AtomicUsize::new(0),
         quit: tokio::sync::Notify::new(),
     });
     if created {
@@ -82,11 +102,23 @@ async fn run() -> Result<(), Error> {
     println!("glft engine {} running (pid {}), id {}", env!("CARGO_PKG_VERSION"), std::process::id(), engine.secret.public());
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("signal handler");
+    let limit = idle_limit();
+    let mut tick = tokio::time::interval(limit.map(|l| (l / 4).clamp(Duration::from_millis(250), Duration::from_secs(10))).unwrap_or(Duration::from_secs(3600)));
+    let mut idle_since = Instant::now();
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
+                    idle_since = Instant::now();
                     tokio::spawn(engine.clone().handle(stream));
+                }
+            }
+            _ = tick.tick() => {
+                if engine.busy().await {
+                    idle_since = Instant::now();
+                } else if limit.is_some_and(|l| idle_since.elapsed() >= l) {
+                    engine.log_note("Nothing needs the engine now (no window open, receiving off, nothing being sent, no pairing for this session only); it stopped and starts again when needed");
+                    break;
                 }
             }
             _ = engine.quit.notified() => break,
@@ -136,7 +168,15 @@ struct ReceivingState {
     endpoint: Endpoint,
     task: JoinHandle<()>,
     folder: String,
-    notice: Option<notify::Notice>,
+    /// What shows that receiving is on: the panel icon, or else a notification.
+    indicator: Indicator,
+}
+
+/// Held for its drop, which takes the icon or notification away.
+#[allow(dead_code)]
+enum Indicator {
+    Icon(tray::Shown),
+    Notice(Option<notify::Notice>),
 }
 
 struct PendingOffer {
@@ -153,9 +193,29 @@ struct Engine {
     receiving: tokio::sync::Mutex<Option<ReceivingState>>,
     offers: Arc<Mutex<BTreeMap<u64, PendingOffer>>>,
     next_offer: AtomicU64,
-    sending: Mutex<BTreeMap<u64, String>>,
+    sending: Mutex<BTreeMap<u64, ActiveSend>>,
     next_send: AtomicU64,
+    /// Arriving transfers by sender, with when they last made progress.
+    incoming: Mutex<BTreeMap<String, (Incoming, Instant)>>,
+    /// Bumped whenever status, offers or devices may have changed, for watching windows.
+    changed: watch::Sender<u64>,
+    /// Connected clients: a terminal command, a window.
+    clients: AtomicUsize,
     quit: tokio::sync::Notify,
+}
+
+struct ActiveSend {
+    info: SendInfo,
+    abort: Option<AbortHandle>,
+}
+
+/// Counts a connected client while it lives.
+struct ClientGuard<'a>(&'a AtomicUsize);
+
+impl Drop for ClientGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 fn now_ms() -> i64 {
@@ -193,16 +253,47 @@ impl Engine {
     fn tee(self: &Arc<Self>, client: ClientTx) -> EventSink {
         let engine = self.clone();
         Arc::new(move |event: Event| {
-            let _ = client.send(reply_of(&event));
-            engine.publish(&event);
+            let reply = reply_of(&event, None);
+            let _ = client.send(reply.clone());
+            engine.publish_as(&event, reply);
+        })
+    }
+
+    /// Events of send `id`: its progress is kept for [`Status::sending`] and tagged.
+    fn send_sink(self: &Arc<Self>, id: u64, client: Option<ClientTx>) -> EventSink {
+        let engine = self.clone();
+        Arc::new(move |event: Event| {
+            if let Some(a) = engine.sending.lock().unwrap().get_mut(&id) {
+                match &event {
+                    Event::SendProgress { done, total } => (a.info.done, a.info.total) = (*done, *total),
+                    Event::Offered { totals, .. } => (a.info.summary, a.info.total) = (totals.to_string(), totals.bytes),
+                    _ => {}
+                }
+            }
+            let reply = reply_of(&event, Some(id));
+            if let Some(c) = &client {
+                let _ = c.send(reply.clone());
+            }
+            engine.publish_as(&event, reply);
         })
     }
 
     fn publish(&self, event: &Event) {
-        if let Event::Received { peer, totals, dest, .. } = event {
-            notify::received(peer, &totals.to_string(), dest);
+        self.publish_as(event, reply_of(event, None));
+    }
+
+    fn publish_as(&self, event: &Event, reply: Reply) {
+        match event {
+            Event::Received { peer, totals, dest, .. } => {
+                notify::received(peer, &totals.to_string(), dest);
+                self.incoming.lock().unwrap().remove(peer);
+            }
+            Event::Progress { peer, done, total } => {
+                let i = Incoming { peer: peer.clone(), done: *done, total: *total };
+                self.incoming.lock().unwrap().insert(peer.clone(), (i, Instant::now()));
+            }
+            _ => {}
         }
-        let reply = reply_of(event);
         if let Reply::Line(l) = &reply {
             println!("{}", l.sentence);
             let mut recent = self.recent.lock().unwrap();
@@ -210,6 +301,8 @@ impl Engine {
             while recent.len() > RECENT_LINES {
                 recent.pop_front();
             }
+            drop(recent);
+            self.changed();
         }
         let _ = self.log.send(reply);
     }
@@ -219,9 +312,27 @@ impl Engine {
         println!("{sentence}");
         self.recent.lock().unwrap().push_back(l.clone());
         let _ = self.log.send(Reply::Line(l));
+        self.changed();
+    }
+
+    /// Tells watching windows to fetch status and devices again.
+    fn changed(&self) {
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Whether anything needs the engine to keep running. A "just this time" pairing
+    /// lives in the engine's memory, so the engine stays until logout or `glft quit`.
+    async fn busy(&self) -> bool {
+        self.clients.load(Ordering::Relaxed) > 0
+            || self.devices.lock().unwrap().has_session_pairings()
+            || !self.sending.lock().unwrap().is_empty()
+            || !self.offers.lock().unwrap().is_empty()
+            || self.receiving.lock().await.is_some()
     }
 
     async fn handle(self: Arc<Self>, stream: UnixStream) {
+        self.clients.fetch_add(1, Ordering::Relaxed);
+        let _client = ClientGuard(&self.clients);
         let (mut lines, mut write) = Conn::new(stream).split();
         let Ok(Some(request)) = read_line::<Request>(&mut lines).await else { return };
         let ack = Reply::Ack { pid: std::process::id(), version: build_id() };
@@ -251,8 +362,13 @@ impl Engine {
             Err(e) => Reply::Failed(ErrorInfo::from(e)),
         });
         drop(tx);
-        let _ = writer.await;
+        // A client that stopped reading (a frozen window) must not hold the engine.
+        let mut writer = writer;
+        if tokio::time::timeout(glft_engine::HEARTBEAT, &mut writer).await.is_err() {
+            writer.abort();
+        }
         reader.abort();
+        self.changed();
     }
 
     async fn serve_request(self: Arc<Self>, request: Request, tx: ClientTx, mut from_client: mpsc::UnboundedReceiver<Request>) -> Result<(), Error> {
@@ -292,9 +408,7 @@ impl Engine {
             Request::Join { code } => self.join_pairing(&code, tx, from_client).await,
             Request::PairAnswer { .. } => Err(Error::new(ErrorKind::ProtocolError, "no pairing in progress")),
             Request::Devices => {
-                let devices = self.devices.lock().unwrap().list();
-                let devices = devices.into_iter().map(|(device, remembered)| DeviceInfo { device, remembered }).collect();
-                let _ = tx.send(Reply::Devices { devices });
+                let _ = tx.send(self.devices_reply());
                 Ok(())
             }
             Request::Forget { device } => {
@@ -341,9 +455,73 @@ impl Engine {
                     None => Err(Error::new(ErrorKind::NoSuchOffer, format!("offer {offer}"))),
                 }
             }
+            Request::CancelSend { id } => {
+                let cancelled = self.sending.lock().unwrap().remove(&id);
+                match cancelled {
+                    Some(a) => {
+                        if let Some(abort) = a.abort {
+                            abort.abort();
+                        }
+                        self.log_note(&format!("Sending to \"{}\" cancelled", a.info.peer));
+                    }
+                    None => {
+                        let _ = tx.send(Reply::Line(note("That send had already finished")));
+                    }
+                }
+                Ok(())
+            }
+            Request::Watch => self.watch(tx, from_client).await,
+            Request::Ping => Ok(()),
             Request::Quit => {
                 self.quit.notify_one();
                 Ok(())
+            }
+        }
+    }
+
+    fn devices_reply(&self) -> Reply {
+        let devices = self.devices.lock().unwrap().list();
+        Reply::Devices { devices: devices.into_iter().map(|(device, remembered)| DeviceInfo { device, remembered }).collect() }
+    }
+
+    /// [`Request::Watch`]: a window's view of the engine, kept up to date.
+    async fn watch(self: &Arc<Self>, tx: ClientTx, mut from_client: mpsc::UnboundedReceiver<Request>) -> Result<(), Error> {
+        let mut live = self.log.subscribe();
+        let mut changes = self.changed.subscribe();
+        let _ = tx.send(Reply::Status(self.status().await));
+        let _ = tx.send(self.devices_reply());
+        let recent: Vec<LogLine> = self.recent.lock().unwrap().iter().cloned().collect();
+        for l in recent {
+            let _ = tx.send(Reply::Line(l));
+        }
+        let deadline = tokio::time::sleep(PING_LIMIT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                r = live.recv() => match r {
+                    Ok(reply) => { let _ = tx.send(reply); }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => return Ok(()),
+                },
+                c = changes.changed() => {
+                    if c.is_err() {
+                        return Ok(());
+                    }
+                    // Many changes in a burst (5,000 small files) make one update.
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    changes.borrow_and_update();
+                    let _ = tx.send(Reply::Status(self.status().await));
+                    let _ = tx.send(self.devices_reply());
+                }
+                m = from_client.recv() => match m {
+                    Some(Request::Ping) => deadline.as_mut().reset(tokio::time::Instant::now() + PING_LIMIT),
+                    Some(_) => {}
+                    None => return Ok(()),
+                },
+                _ = &mut deadline => {
+                    self.log_note(&format!("A glft window stopped answering for {} seconds; the engine no longer counts it as open", PING_LIMIT.as_secs()));
+                    return Err(Error::new(ErrorKind::EngineNotAnswering, "the window stopped sending its heartbeat"));
+                }
             }
         }
     }
@@ -353,14 +531,22 @@ impl Engine {
             Some(r) => Some(Receiving { folder: r.folder.clone(), addrs: net::reachable_addrs(&r.endpoint).await }),
             None => None,
         };
+        let incoming = {
+            let mut incoming = self.incoming.lock().unwrap();
+            incoming.retain(|_, (_, at)| at.elapsed() < INCOMING_STALE);
+            incoming.values().map(|(i, _)| i.clone()).collect()
+        };
+        let offers = self.offers.lock().unwrap();
         Status {
             pid: std::process::id(),
             version: build_id(),
             id: self.secret.public().to_string(),
             name: paths::device_name(),
             receiving,
-            sending: self.sending.lock().unwrap().values().cloned().collect(),
-            offers: self.offers.lock().unwrap().len(),
+            sending: self.sending.lock().unwrap().values().map(|a| a.info.clone()).collect(),
+            incoming,
+            offers: offers.len(),
+            waiting: offers.values().map(|o| o.info.clone()).collect(),
         }
     }
 
@@ -398,9 +584,12 @@ impl Engine {
                 sink(Event::Failed(e));
             }
         });
-        let notice = notify::receiving(self.clone(), folder.clone());
+        let indicator = match tray::show(self.clone(), folder.clone()).await {
+            Some(icon) => Indicator::Icon(icon),
+            None => Indicator::Notice(notify::receiving(self.clone(), folder.clone())),
+        };
         events(Event::ReceiveFolder { dir: folder.clone() });
-        *receiving = Some(ReceivingState { endpoint, task, folder, notice });
+        *receiving = Some(ReceivingState { endpoint, task, folder, indicator });
         Ok(())
     }
 
@@ -428,6 +617,7 @@ impl Engine {
                 let info = OfferInfo { id, peer: offer.peer.clone(), summary: offer.totals.to_string(), dest: offer.dest.clone() };
                 let (answer, rx) = oneshot::channel();
                 engine.offers.lock().unwrap().insert(id, PendingOffer { info: info.clone(), answer });
+                engine.changed();
                 engine.log_note(&format!("Answer with `glft accept {id}` or `glft decline {id}`, or from the notification"));
                 let _ = engine.log.send(Reply::Offer(info.clone()));
                 let notice = notify::offer(engine.clone(), info);
@@ -437,6 +627,7 @@ impl Engine {
                     move || {
                         engine.offers.lock().unwrap().remove(&id);
                         drop(notice);
+                        engine.changed();
                     }
                 }));
                 rx.await.unwrap_or(false)
@@ -509,12 +700,13 @@ impl Engine {
         tx: ClientTx,
         mut from_client: mpsc::UnboundedReceiver<Request>,
     ) -> Result<(), Error> {
-        let (id, mut addrs, name) = {
+        // `paired`: the paired device's name, which the log uses until it tells its own.
+        let (id, mut addrs, name, paired) = {
             let store = self.devices.lock().unwrap();
             match store.find(&device) {
-                Ok(d) => (d.endpoint_id().ok_or_else(|| Error::new(ErrorKind::BadDeviceId, d.id.clone()))?, d.dial_addrs(), d.name.clone()),
+                Ok(d) => (d.endpoint_id().ok_or_else(|| Error::new(ErrorKind::BadDeviceId, d.id.clone()))?, d.dial_addrs(), d.name.clone(), Some(d.name.clone())),
                 Err(e) => match net::parse_id(&device) {
-                    Ok(id) => (id, Vec::new(), net::short_id(&id)),
+                    Ok(id) => (id, Vec::new(), net::short_id(&id), None),
                     Err(_) => return Err(e),
                 },
             }
@@ -527,11 +719,13 @@ impl Engine {
         };
         let peer = net::peer_addr(id, &addrs);
         let send_id = self.next_send.fetch_add(1, Ordering::Relaxed);
-        self.sending.lock().unwrap().insert(send_id, format!("to \"{name}\": {} item(s)", paths.len()));
-        let events = if detach { self.sink() } else { self.tee(tx.clone()) };
+        let info = SendInfo { id: send_id, peer: name.clone(), summary: format!("{} item(s)", paths.len()), done: 0, total: 0 };
+        self.sending.lock().unwrap().insert(send_id, ActiveSend { info, abort: None });
+        self.changed();
+        let events = self.send_sink(send_id, (!detach).then(|| tx.clone()));
         let engine = self.clone();
         let task = tokio::spawn(async move {
-            let result = transfer::send(&endpoint, peer, paths, &events).await;
+            let result = transfer::send_to(&endpoint, peer, paired.as_deref(), paths, &events).await;
             if let Ok(delivered) = &result {
                 // The address that worked goes first next time; local network lookup
                 // still finds the device if it has moved.
@@ -541,8 +735,12 @@ impl Engine {
                 endpoint.close().await;
             }
             engine.sending.lock().unwrap().remove(&send_id);
+            engine.changed();
             result.map(|_| ())
         });
+        if let Some(a) = self.sending.lock().unwrap().get_mut(&send_id) {
+            a.abort = Some(task.abort_handle());
+        }
         if detach {
             let _ = tx.send(Reply::Line(note(&format!(
                 "Sending to \"{name}\" in the background; `glft status` shows it, `glft log -f` follows it"
@@ -563,7 +761,7 @@ impl Engine {
 }
 
 async fn stop(r: ReceivingState) {
-    drop(r.notice);
+    drop(r.indicator);
     r.endpoint.close().await;
     r.task.abort();
 }
@@ -573,10 +771,10 @@ async fn closed(from_client: &mut mpsc::UnboundedReceiver<Request>) {
     while from_client.recv().await.is_some() {}
 }
 
-fn reply_of(event: &Event) -> Reply {
+fn reply_of(event: &Event, send: Option<u64>) -> Reply {
     match event {
-        Event::Progress { done, total } => Reply::Progress { done: *done, total: *total, sending: false },
-        Event::SendProgress { done, total } => Reply::Progress { done: *done, total: *total, sending: true },
+        Event::Progress { peer, done, total } => Reply::Progress { done: *done, total: *total, sending: false, send: None, peer: Some(peer.clone()) },
+        Event::SendProgress { done, total } => Reply::Progress { done: *done, total: *total, sending: true, send, peer: None },
         e => Reply::Line(line(e)),
     }
 }

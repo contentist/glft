@@ -30,9 +30,19 @@ enum Outcome {
     Dismissed,
 }
 
+/// Set (to anything) to show no notifications or panel icon, e.g. in tests.
+pub const NO_DESKTOP_ENV: &str = "GLFT_NO_DESKTOP";
+
+pub fn disabled() -> bool {
+    std::env::var_os(NO_DESKTOP_ENV).is_some()
+}
+
 /// Shows `n` and calls `on_outcome` with what the person did, until the `Notice` is dropped.
 fn show(n: Notification, on_outcome: impl Fn(Outcome) -> bool + Send + 'static) -> Notice {
     let (cancel, mut cancelled) = oneshot::channel();
+    if disabled() {
+        return Notice { cancel: Some(cancel) };
+    }
     tokio::spawn(async move {
         loop {
             let Ok(handle) = n.show_async().await else { return };
@@ -117,6 +127,9 @@ pub fn received(peer: &str, summary: &str, dest: &str) {
         .body(&format!("{summary}, every file verified, in {dest}"))
         .icon("document-save")
         .timeout(Timeout::Default);
+    if disabled() {
+        return;
+    }
     tokio::spawn(async move {
         let _ = n.show_async().await;
     });

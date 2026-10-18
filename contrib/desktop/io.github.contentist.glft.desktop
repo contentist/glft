@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=glft
+GenericName=File transfer
+Comment=Send files and folders directly between your phone and this computer, verified
+Exec=glft-window %F
+Icon=io.github.contentist.glft
+Terminal=false
+Categories=Network;FileTransfer;GTK;
+Keywords=send;receive;phone;transfer;share;
+StartupNotify=true
+StartupWMClass=glft-window

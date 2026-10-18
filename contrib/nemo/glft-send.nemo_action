@@ -1,0 +1,8 @@
+[Nemo Action]
+Active=true
+Name=Send to phone…
+Comment=Send the selected files and folders to a paired device with glft
+Exec=glft-window %F
+Icon-Name=io.github.contentist.glft
+Selection=notnone
+Extensions=any;

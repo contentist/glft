@@ -7,6 +7,8 @@
 //! acknowledged straight away; a client that hears nothing within two seconds says the
 //! engine is not answering (design rule 1, the heartbeat).
 
+pub mod client;
+
 use std::{
     io,
     net::SocketAddr,
@@ -71,8 +73,21 @@ pub enum Request {
     /// Offers waiting for an answer.
     Offers,
     Answer { offer: u64, accept: bool },
+    /// Stop a send, by the id in [`Status::sending`].
+    CancelSend { id: u64 },
+    /// For a window: status and devices now and on every change, the log, progress and
+    /// offers, until the client leaves or stops sending [`Request::Ping`].
+    Watch,
+    /// The heartbeat of a [`Request::Watch`], every [`PING_EVERY`].
+    Ping,
     Quit,
 }
+
+/// How often a watching client pings.
+pub const PING_EVERY: Duration = Duration::from_secs(2);
+
+/// A watching client that has not pinged for this long is taken to be frozen or gone.
+pub const PING_LIMIT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "kebab-case")]
@@ -85,6 +100,12 @@ pub enum Reply {
         /// Sent rather than received and verified.
         #[serde(default)]
         sending: bool,
+        /// Which send, by its id in [`Status::sending`].
+        #[serde(default)]
+        send: Option<u64>,
+        /// Receiving: who is sending.
+        #[serde(default)]
+        peer: Option<String>,
     },
     Status(Status),
     Devices { devices: Vec<DeviceInfo> },
@@ -135,8 +156,41 @@ pub struct Status {
     pub name: String,
     /// While receiving: the folder, and the addresses others can use.
     pub receiving: Option<Receiving>,
-    pub sending: Vec<String>,
+    pub sending: Vec<SendInfo>,
+    /// Transfers arriving now.
+    #[serde(default)]
+    pub incoming: Vec<Incoming>,
     pub offers: usize,
+    /// The offers waiting for an answer.
+    #[serde(default)]
+    pub waiting: Vec<OfferInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendInfo {
+    pub id: u64,
+    pub peer: String,
+    /// "3 item(s)", until the files have been read; then "1 folder, 23 files, 232 MB".
+    pub summary: String,
+    pub done: u64,
+    pub total: u64,
+}
+
+impl std::fmt::Display for SendInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "to \"{}\": {}", self.peer, self.summary)?;
+        if let Some(pct) = (self.done * 100).checked_div(self.total) {
+            write!(f, ", {pct}%")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Incoming {
+    pub peer: String,
+    pub done: u64,
+    pub total: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

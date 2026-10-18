@@ -176,7 +176,7 @@ async fn receiver_restart_mid_file_resumes_without_asking() {
     let asked = Arc::new(AtomicUsize::new(0));
 
     // First receiver: stopped as soon as 8 MB of the big file are verified and recorded.
-    let (rx_events, _, cut) = watched(|e| matches!(e, Event::Progress { done, total } if *done >= 8 << 20 && done < total));
+    let (rx_events, _, cut) = watched(|e| matches!(e, Event::Progress { done, total, .. } if *done >= 8 << 20 && done < total));
     let rx = start_receiver(&rx_key, port, dest.path(), state.path(), counting_yes(asked.clone()), rx_events, false).await;
 
     let (tx_events, tx_log, _) = watched(|_| false);
@@ -226,7 +226,7 @@ async fn receiver_back_on_a_new_address_is_found_quickly() {
     let port = free_port();
     let asked = Arc::new(AtomicUsize::new(0));
 
-    let (rx_events, _, cut) = watched(|e| matches!(e, Event::Progress { done, total } if *done >= 8 << 20 && done < total));
+    let (rx_events, _, cut) = watched(|e| matches!(e, Event::Progress { done, total, .. } if *done >= 8 << 20 && done < total));
     let rx = start_receiver(&rx_key, port, dest.path(), state.path(), counting_yes(asked.clone()), rx_events, false).await;
     let (tx_events, tx_log, resumed) = watched(|e| matches!(e, Event::ResumingSend { .. }));
     let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
@@ -360,7 +360,7 @@ async fn sender_restart_resumes_the_same_files() {
     let rx_key = SecretKey::generate();
     let port = free_port();
     let asked = Arc::new(AtomicUsize::new(0));
-    let (rx_events, rx_log, cut) = watched(|e| matches!(e, Event::Progress { done, total } if *done >= 8 << 20 && done < total));
+    let (rx_events, rx_log, cut) = watched(|e| matches!(e, Event::Progress { done, total, .. } if *done >= 8 << 20 && done < total));
     let rx = start_receiver(&rx_key, port, dest.path(), state.path(), counting_yes(asked.clone()), rx_events, false).await;
     let peer = net::peer_addr(rx_key.public(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
     let tx_key = SecretKey::generate();

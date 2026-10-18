@@ -56,7 +56,7 @@ pub enum Event {
     FileVerified { path: String, saved_to: String },
     FileSent { path: String },
     /// Receiving: bytes verified so far in this transfer.
-    Progress { done: u64, total: u64 },
+    Progress { peer: String, done: u64, total: u64 },
     /// Bytes sent so far; the receiver verifies them as they arrive.
     SendProgress { done: u64, total: u64 },
     /// Receiving: an interrupted transfer continues without asking again.
@@ -112,7 +112,7 @@ impl fmt::Display for Event {
             Self::Renamed { from, to } => write!(f, "\"{from}\" already exists here; saving as \"{to}\""),
             Self::FileVerified { path, saved_to } => write!(f, "{path} verified, saved to {saved_to}"),
             Self::FileSent { path } => write!(f, "{path} sent"),
-            Self::Progress { done, total } => write!(f, "{} of {} verified", human_bytes(*done), human_bytes(*total)),
+            Self::Progress { done, total, .. } => write!(f, "{} of {} verified", human_bytes(*done), human_bytes(*total)),
             Self::SendProgress { done, total } => write!(f, "{} of {} sent", human_bytes(*done), human_bytes(*total)),
             Self::ResumingReceive { peer, accepted_at, files_done, files, bytes_left } => write!(
                 f,

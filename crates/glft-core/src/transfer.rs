@@ -664,8 +664,10 @@ pub async fn serve(endpoint: &Endpoint, opts: Arc<ReceiveOptions>, events: &Even
     while let Some(incoming) = endpoint.accept().await {
         let conn = match incoming.await {
             Ok(conn) => conn,
+            // A sender that gave up mid-handshake (a dial raced on several addresses, or the
+            // link dropped) tries again by itself; nothing to report here.
             Err(e) => {
-                events(Event::Failed(Error::new(ErrorKind::ConnectionLost, e.to_string())));
+                tracing::debug!("connection lost during the handshake: {e}");
                 continue;
             }
         };
@@ -887,7 +889,10 @@ async fn receive_offer(
                 FileState::Waiting => {}
             }
             if in_flight.len() >= PARALLEL_FILES {
-                in_flight.join_next().await.expect("set is not empty").map_err(task_failed)??;
+                let result = in_flight.join_next().await.expect("set is not empty").map_err(task_failed)?;
+                if let Err(e) = result {
+                    return Err(settle(in_flight, e).await);
+                }
             }
             let (job, file, events) = (job.clone(), file.clone(), events.clone());
             let rel = rebase(&file.path, &renames);
@@ -901,7 +906,9 @@ async fn receive_offer(
             });
         }
         while let Some(result) = in_flight.join_next().await {
-            result.map_err(task_failed)??;
+            if let Err(e) = result.map_err(task_failed)? {
+                return Err(settle(in_flight, e).await);
+            }
         }
         Ok::<(), Error>(())
     }
@@ -942,7 +949,16 @@ async fn receive_offer(
     Ok(())
 }
 
-/// Bytes verified in the current transfer, reported at checkpoints and file ends.
+/// After one file failed: on a lost connection the other files are failing too, and each
+/// is let finish saving what it verified; any other error cancels them.
+async fn settle(mut in_flight: tokio::task::JoinSet<Result<(), Error>>, e: Error) -> Error {
+    if e.kind == ErrorKind::ConnectionLost {
+        while in_flight.join_next().await.is_some() {}
+    }
+    e
+}
+
+/// Bytes verified in the current transfer, reported as they are written.
 struct Progress {
     peer: String,
     done: AtomicU64,
@@ -1083,12 +1099,20 @@ async fn fetch_file(job: &Job, index: usize, file: &FileEntry, rel: String) -> R
         let mut buf_start = start;
         let mut written = start;
         let mut synced = start;
+        let mut reported = start;
+        let mut failed = None;
         loop {
             let item = match decoder.next().await {
                 ResponseDecoderNext::Done(_) => break,
                 ResponseDecoderNext::More((next, item)) => {
                     decoder = next;
-                    item.map_err(|e| decode_error(e, &file.path))?
+                    match item {
+                        Ok(item) => item,
+                        Err(e) => {
+                            failed = Some(decode_error(e, &file.path));
+                            break;
+                        }
+                    }
                 }
             };
             if let BaoContentItem::Leaf(leaf) = item {
@@ -1096,10 +1120,11 @@ async fn fetch_file(job: &Job, index: usize, file: &FileEntry, rel: String) -> R
                     let len = buf.len() as u64;
                     target = write_at(target, buf_start, buf.split().freeze(), &rel).await?;
                     written = buf_start + len;
+                    progress.report(written - reported);
+                    reported = written;
                     if written - synced >= CHECKPOINT {
                         target = sync(target, &rel).await?;
                         live.set(index, FileState::Partial { token: token.clone(), verified: written });
-                        progress.report(written - synced);
                         synced = written;
                     }
                 }
@@ -1109,12 +1134,22 @@ async fn fetch_file(job: &Job, index: usize, file: &FileEntry, rel: String) -> R
                 buf.extend_from_slice(&leaf.data);
             }
         }
+        // Every buffered leaf was verified on arrival, so it is kept even when the
+        // connection dropped: on a poor link each attempt then moves the file forward,
+        // however short it was.
         if !buf.is_empty() {
             let len = buf.len() as u64;
             target = write_at(target, buf_start, buf.split().freeze(), &rel).await?;
             written = buf_start + len;
         }
-        progress.report(written - synced);
+        progress.report(written - reported);
+        if let Some(e) = failed {
+            if written > synced {
+                sync(target, &rel).await?;
+                live.set(index, FileState::Partial { token, verified: written });
+            }
+            return Err(e);
+        }
     }
     // Every chunk was checked against the fingerprint on arrival (and the part from an
     // earlier attempt when it arrived then), so the file is complete and verified;

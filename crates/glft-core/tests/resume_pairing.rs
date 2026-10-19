@@ -520,3 +520,63 @@ async fn a_full_disk_on_the_receiver_stops_the_sender_with_a_sentence() {
     assert_eq!(err.kind, glft_core::ErrorKind::PeerDiskFull, "{err:?}");
     assert!(rx_log.lock().unwrap().join("\n").contains("The disk is full"));
 }
+
+/// A link so poor that every attempt drops before the 8 MiB checkpoint still moves forward:
+/// what arrived verified is kept each time, so resuming never starts over (the "0 bytes
+/// here" loop seen when a fast second sender starved a phone).
+#[tokio::test(flavor = "multi_thread")]
+async fn short_attempts_each_keep_what_arrived() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let file = src.path().join("big.bin");
+    fs::write(&file, noise(40 * 1024 * 1024 + 5, 3)).unwrap();
+    let part = dest.path().join(".big.bin.glft-part");
+    let rx_key = SecretKey::generate();
+    let port = free_port();
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let k = kept.clone();
+    let rx_events: EventSink = Arc::new(move |e: Event| {
+        if let Event::ReceiveInterrupted { done, .. } = e {
+            k.lock().unwrap().push(done);
+        }
+    });
+    let rx = start_receiver(&rx_key, port, dest.path(), state.path(), counting_yes(Arc::new(AtomicUsize::new(0))), rx_events, false).await;
+    let peer = net::peer_addr(rx_key.public(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+    let tx_key = SecretKey::generate();
+
+    let mut base = 0;
+    for round in 0..3 {
+        let tx = net::bind_ephemeral(tx_key.clone()).await.unwrap();
+        let (f, p, ep) = (file.clone(), peer.clone(), tx.clone());
+        let attempt = tokio::spawn(async move {
+            let _ = transfer::send(&tx, p, vec![f], &glft_core::events::discard()).await;
+        });
+        // Cut as soon as one more 4 MiB write has landed, well short of a checkpoint.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while fs::metadata(&part).map(|m| m.len()).unwrap_or(0) < base + (4 << 20) {
+            assert!(Instant::now() < deadline, "round {round}: nothing arrived");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        attempt.abort();
+        let _ = attempt.await;
+        ep.close().await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while kept.lock().unwrap().len() <= round {
+            assert!(Instant::now() < deadline, "round {round}: the receiver never noticed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let done = kept.lock().unwrap()[round];
+        assert!(done >= base + (4 << 20), "round {round}: kept {done} bytes, had {base} before");
+        assert_eq!(done, fs::metadata(&part).unwrap().len(), "round {round}: all that was written is kept");
+        base = done;
+    }
+
+    let tx = net::bind_ephemeral(tx_key).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(90), transfer::send(&tx, peer, vec![file.clone()], &glft_core::events::discard()))
+        .await
+        .expect("finishes")
+        .unwrap();
+    assert!(fs::read(&file).unwrap() == fs::read(dest.path().join("big.bin")).unwrap(), "arrived intact");
+    rx.task.abort();
+}

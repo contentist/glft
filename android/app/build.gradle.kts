@@ -7,6 +7,11 @@ plugins {
 
 val ndkPinned = "30.0.16248370"
 
+// One version for the whole project: the workspace's, from Cargo.toml.
+val glftVersion = rootDir.resolve("../Cargo.toml").readLines()
+    .first { it.startsWith("version = ") }.substringAfter('"').substringBefore('"')
+val glftVersionCode = glftVersion.split('.').map(String::toInt).let { (a, b, c) -> a * 10000 + b * 100 + c }
+
 android {
     namespace = "io.github.contentist.glft"
     compileSdk = 37
@@ -16,8 +21,8 @@ android {
         applicationId = "io.github.contentist.glft"
         minSdk = 34
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = glftVersionCode
+        versionName = glftVersion
         ndk { abiFilters += "arm64-v8a" }
     }
 

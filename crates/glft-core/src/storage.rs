@@ -48,6 +48,11 @@ pub trait ReceiveStorage: Send + Sync {
     fn discard_abandoned(&self, token: &str) -> io::Result<()>;
     /// How the folder holding `rel` reads to a person: `~/Downloads/glft/Album`.
     fn describe(&self, rel: &str) -> String;
+    /// The file or folder at `rel` as a path on this device, where it has one, so it can
+    /// be shown in the file manager.
+    fn local_path(&self, _rel: &str) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Extended attribute holding a received file's BLAKE3 fingerprint, hex.
@@ -147,6 +152,10 @@ impl ReceiveStorage for FsStorage {
         let ours = path.starts_with(&self.root)
             && path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(crate::manifest::PARTIAL_SUFFIX));
         if ours { fs::remove_file(path) } else { Ok(()) }
+    }
+
+    fn local_path(&self, rel: &str) -> Option<std::path::PathBuf> {
+        Some(self.path(rel))
     }
 
     fn describe(&self, rel: &str) -> String {

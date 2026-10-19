@@ -10,6 +10,8 @@ use std::{
     process::ExitCode,
 };
 
+mod install;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use glft_core::{
     Error, ErrorKind,
@@ -21,7 +23,8 @@ use glft_core::{
 use glft_engine::{ErrorInfo, LogLine, Reply, Request, client};
 
 #[derive(Parser)]
-#[command(name = "glft", version, about = "Send files directly between your devices, verified.")]
+// `glft help` is glft's own: help pages, then a command's usage.
+#[command(name = "glft", version, about = "Send files directly between your devices, verified.", disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -98,8 +101,17 @@ enum Command {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
-    /// Install the engine as a systemd user service (done automatically on first use).
+    /// Explain an error by the id in its details, or show a command's usage; alone, list the topics.
+    Help { topic: Option<String> },
+    /// Install glft for this user (from an unpacked download) or set it up again: the engine
+    /// service, the menu entry and Nemo's "Send to phone…".
     Setup,
+    /// Stop the engine and remove glft for this user; your key and pairings are kept.
+    Uninstall {
+        /// Also remove this computer's key and pairings.
+        #[arg(long)]
+        purge: bool,
+    },
     /// Restart the engine, e.g. after updating glft.
     Restart,
     /// Stop the engine; receiving stops too. The next command starts it again.
@@ -193,7 +205,9 @@ async fn run(command: Command) -> Result<ExitCode> {
         }
         Command::Send { device, addrs, detach, paths } => {
             let paths = paths.into_iter().map(|p| std::path::absolute(&p).unwrap_or(p)).collect();
-            Session::open(Request::Send { device, addrs, paths, detach }).await?.drain().await?;
+            let mut s = Session::open(Request::Send { device, addrs, paths, detach }).await?;
+            s.ctrl_c_stops = !detach;
+            s.drain().await?;
         }
         Command::Cancel { send } => Session::open(Request::CancelSend { id: send }).await?.drain().await?,
         Command::Offers => {
@@ -204,10 +218,9 @@ async fn run(command: Command) -> Result<ExitCode> {
         Command::Accept { offer } => answer(offer, true).await?,
         Command::Decline { offer } => answer(offer, false).await?,
         Command::Verify { paths } => return Ok(verify(&paths)),
-        Command::Setup => {
-            install_units(true)?;
-            install_desktop()?;
-        }
+        Command::Help { topic } => return Ok(help(topic.as_deref())),
+        Command::Setup => install::setup().await?,
+        Command::Uninstall { purge } => return install::uninstall(purge).await,
         Command::Restart => {
             if let Ok(s) = Session::try_open(Request::Quit).await {
                 let _ = s.finish().await;
@@ -389,6 +402,8 @@ fn hash_file(path: &Path) -> std::io::Result<String> {
 /// A request to the engine, printing log lines and progress as they come.
 struct Session {
     inner: client::Session,
+    /// For an attached `glft send`, where Ctrl-C stops the transfer.
+    ctrl_c_stops: bool,
 }
 
 impl Session {
@@ -407,7 +422,7 @@ impl Session {
         if client::Session::outdated() {
             out().line("Note: the running engine is older than the installed glftd; `glft restart` switches to it.");
         }
-        Self { inner }
+        Self { inner, ctrl_c_stops: false }
     }
 
     /// The next reply that is not a log line or progress (those are printed), or `None`
@@ -419,7 +434,12 @@ impl Session {
                     out().clear();
                     return Ok(None);
                 }
-                Ok(Some(Reply::Line(l))) => out().log(&l),
+                Ok(Some(Reply::Line(l))) => {
+                    out().log(&l);
+                    if self.ctrl_c_stops && l.sentence.ends_with("waiting to resume") {
+                        out().line("It resumes by itself when the device is back; Ctrl-C stops the send.");
+                    }
+                }
                 Ok(Some(Reply::Progress { done, total, sending, .. })) => out().progress(done, total, sending),
                 Ok(Some(Reply::Offer(o))) => {
                     out().line(&format!("{} offers {}; `glft accept {}` or `glft decline {}`", o.peer, o.summary, o.id, o.id));
@@ -449,56 +469,6 @@ fn announce_setup(dir: &Path) {
         "Set up glft's engine as a systemd user service (glft.socket, glft.service in {}). It starts when a glft command needs it and listens on the network only while receiving is on.",
         tilde(dir)
     ));
-}
-
-/// `glft setup`: the systemd units.
-fn install_units(verbose: bool) -> Result<()> {
-    let dir = glft_engine::unit_dir().map_err(local)?;
-    if client::install_units()? {
-        announce_setup(&dir);
-    } else if verbose {
-        out().line(&format!("glft's engine is set up (units in {})", tilde(&dir)));
-    }
-    Ok(())
-}
-
-/// The window's menu entry, icon and Nemo's "Send to phone…", for this user, when
-/// `glft-window` is installed next to `glft`. Packages install them system-wide instead.
-fn install_desktop() -> Result<()> {
-    let window = client::sibling("glft-window");
-    let Ok(window) = std::fs::canonicalize(&window) else {
-        out().line("The glft window isn't installed next to glft, so no menu entry or Nemo action was set up.");
-        return Ok(());
-    };
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok_or_else(|| local(Error::new(ErrorKind::NoHomeDir, "neither XDG_DATA_HOME nor HOME is set")))?;
-    let exe = window.display().to_string();
-    let exe = if exe.contains(' ') { format!("\"{exe}\"") } else { exe };
-    let exec = |template: &str| template.replace("Exec=glft-window", &format!("Exec={exe}"));
-    let files = [
-        ("applications/io.github.contentist.glft.desktop", exec(include_str!("../../../contrib/desktop/io.github.contentist.glft.desktop"))),
-        ("icons/hicolor/scalable/apps/io.github.contentist.glft.svg", include_str!("../../../contrib/desktop/io.github.contentist.glft.svg").to_string()),
-        ("nemo/actions/glft-send.nemo_action", exec(include_str!("../../../contrib/nemo/glft-send.nemo_action"))),
-    ];
-    for (rel, content) in &files {
-        let path = data.join(rel);
-        if std::fs::read_to_string(&path).ok().as_deref() == Some(content.as_str()) {
-            continue;
-        }
-        let dir = path.parent().expect("has a folder");
-        std::fs::create_dir_all(dir).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, dir, e)))?;
-        std::fs::write(&path, content).map_err(|e| local(Error::io(ErrorKind::DataDirUnwritable, &path, e)))?;
-        out().line(&format!("Installed {}", tilde(&path)));
-    }
-    let _ = std::process::Command::new("update-desktop-database")
-        .arg(data.join("applications"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    out().line("glft is in the menu, and Nemo's right-click menu has \"Send to phone…\" (open a new Nemo window to see it).");
-    Ok(())
 }
 
 fn tilde(path: &Path) -> String {
@@ -548,6 +518,9 @@ impl Out {
             if let Some(d) = &l.detail {
                 eprintln!("{:>10}  details: {d}", "");
             }
+            if let Some(id) = l.id.as_deref().filter(|id| glft_core::help::page(id).is_some()) {
+                eprintln!("{:>10}  More: `glft help {id}`", "");
+            }
         } else {
             println!("{time}    {}", l.sentence);
         }
@@ -570,4 +543,36 @@ fn print_error(e: &ErrorInfo) {
     eprintln!("{time}    {}", e.headline);
     eprintln!("{:>10}  What to do: {}", "", e.next_step);
     eprintln!("{:>10}  details: [{}] {}", "", e.id, e.detail);
+    if glft_core::help::page(&e.id).is_some() {
+        eprintln!("{:>10}  More: `glft help {}`", "", e.id);
+    }
+}
+
+/// `glft help [topic]`: a help page, or the list of them.
+fn help(topic: Option<&str>) -> ExitCode {
+    match topic.map(|t| (t, glft_core::help::page(t))) {
+        Some((_, Some(page))) => {
+            // Markdown reads well as it is; only the bold markers go.
+            print!("{}", page.replace("**", ""));
+            ExitCode::SUCCESS
+        }
+        Some((t, None)) => {
+            use clap::CommandFactory;
+            if let Some(command) = Cli::command().find_subcommand(t) {
+                let _ = command.clone().bin_name(format!("glft {t}")).print_long_help();
+                return ExitCode::SUCCESS;
+            }
+            eprintln!("There's no help page or command called \"{t}\". `glft help` lists them.");
+            ExitCode::FAILURE
+        }
+        None => {
+            println!("Help pages: `glft help <topic>`. An error's details start with its topic, e.g. [peer-unreachable].");
+            println!("Commands: `glft --help`, or `glft help <command>`.");
+            println!();
+            for (id, title) in glft_core::help::topics() {
+                println!("  {id:<26} {title}");
+            }
+            ExitCode::SUCCESS
+        }
+    }
 }

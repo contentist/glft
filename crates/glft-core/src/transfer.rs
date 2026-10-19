@@ -41,11 +41,11 @@ use iroh_io::{TokioStreamReader, TokioStreamWriter};
 
 use crate::{
     error::{Error, ErrorKind},
-    events::{Event, EventSink, Totals},
+    events::{Event, EventSink, Placed, Totals},
     manifest::{self, FileEntry, Manifest, Source},
     net::{self, ALPN, short_id},
     paths::device_name,
-    proto::{self, Answer, Done, FileRequest, Offer, Resumed, lost},
+    proto::{self, Answer, Done, FileRequest, Offer, Resumed, Saved, lost},
     resume::{self, FileState, Live, Record, Records},
     storage::{Partial, ReceiveStorage},
 };
@@ -134,7 +134,7 @@ fn retryable(kind: ErrorKind) -> bool {
 }
 
 /// A finished delivery.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Delivered {
     pub totals: Totals,
     /// The receiver's address the transfer ended on, worth trying first next time.
@@ -144,6 +144,9 @@ pub struct Delivered {
     /// The mesh (Yggdrasil) if that is what carried the data at the end; `None` for the
     /// local network.
     pub via: Option<&'static str>,
+    /// Where the receiver saved each item ("~/Downloads/glft/Album"), in the order sent;
+    /// empty if it didn't say (a version from before it did).
+    pub saved: Vec<String>,
 }
 
 /// What the local network is called in route sentences.
@@ -185,6 +188,7 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, name: Option<&
     let mut s = SendState {
         label: name.map(|n| format!("\"{n}\"")).unwrap_or_else(|| short_id(&peer.id)),
         told_connecting: false,
+        saved: Vec::new(),
         accepted: false,
         connected: false,
         reached: reached.clone(),
@@ -232,8 +236,8 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, name: Option<&
                 s.progress.set(totals.bytes);
                 let secs = s.started.elapsed().as_secs_f64();
                 let via = (*s.route.lock().unwrap()).filter(|r| *r != LOCAL_NETWORK);
-                events(Event::Finished { peer: s.label, totals, secs, via });
-                return Ok(Delivered { totals, addr: s.addr, secs, via });
+                events(Event::Finished { peer: s.label, totals, secs, via, saved: s.saved.clone() });
+                return Ok(Delivered { totals, addr: s.addr, secs, via, saved: s.saved });
             }
             Err(e) if s.accepted && retryable(e.kind) => {
                 tracing::debug!(peer = %s.label, kind = e.kind.id(), detail = %e.detail, ?backoff, "attempt failed; retrying");
@@ -290,6 +294,8 @@ async fn new_addrs(endpoint: &Endpoint, peer: &EndpointAddr) -> EndpointAddr {
 
 struct SendState {
     label: String,
+    /// Where the receiver says it saved each item, once it has said.
+    saved: Vec<String>,
     /// "Connecting to …" was said; redialling a new address doesn't say it again.
     told_connecting: bool,
     /// The receiver accepted at least once, so this transfer is now worth resuming.
@@ -416,6 +422,13 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
             Err(Error::new(ErrorKind::ConnectionLost, format!("no progress for {} seconds", STALL.as_secs())))
         }
     };
+    // Then where it was saved, from a receiver new enough to say; an older one just closes.
+    if done.is_ok() {
+        let saved = tokio::time::timeout(Duration::from_secs(2), proto::read::<Saved>(&mut ctl_recv)).await;
+        if let Ok(Ok(saved)) = saved {
+            s.saved = saved.places;
+        }
+    }
     server.abort();
     drop(route_watch);
     // Remember a private IPv4 address if the connection had one, or else the one dialled
@@ -826,41 +839,70 @@ async fn receive_offer(
     });
     // Several files in flight hide the per-file round trip and fsync. Dropping the set
     // on an error cancels the rest; the record keeps what was verified.
-    let mut in_flight = tokio::task::JoinSet::new();
-    for (index, file) in manifest.files.iter().enumerate() {
-        match job.live.get(index) {
-            FileState::Done => {
-                job.progress.add(file.size);
-                continue;
+    let fetched = async {
+        let mut in_flight = tokio::task::JoinSet::new();
+        for (index, file) in manifest.files.iter().enumerate() {
+            match job.live.get(index) {
+                FileState::Done => {
+                    job.progress.add(file.size);
+                    continue;
+                }
+                FileState::Partial { verified, .. } => job.progress.add(verified),
+                FileState::Waiting => {}
             }
-            FileState::Partial { verified, .. } => job.progress.add(verified),
-            FileState::Waiting => {}
-        }
-        if in_flight.len() >= PARALLEL_FILES {
-            in_flight.join_next().await.expect("set is not empty").map_err(task_failed)??;
-        }
-        let (job, file, events) = (job.clone(), file.clone(), events.clone());
-        let rel = rebase(&file.path, &renames);
-        in_flight.spawn(async move {
-            fetch_file(&job, index, &file, rel.clone()).await?;
-            events(Event::FileVerified {
-                path: rel.rsplit('/').next().unwrap_or_default().to_string(),
-                saved_to: job.storage.describe(&rel),
+            if in_flight.len() >= PARALLEL_FILES {
+                in_flight.join_next().await.expect("set is not empty").map_err(task_failed)??;
+            }
+            let (job, file, events) = (job.clone(), file.clone(), events.clone());
+            let rel = rebase(&file.path, &renames);
+            in_flight.spawn(async move {
+                fetch_file(&job, index, &file, rel.clone()).await?;
+                events(Event::FileVerified {
+                    path: rel.rsplit('/').next().unwrap_or_default().to_string(),
+                    saved_to: job.storage.describe(&rel),
+                });
+                Ok::<(), Error>(())
             });
-            Ok::<(), Error>(())
-        });
+        }
+        while let Some(result) = in_flight.join_next().await {
+            result.map_err(task_failed)??;
+        }
+        Ok::<(), Error>(())
     }
-    while let Some(result) = in_flight.join_next().await {
-        result.map_err(task_failed)??;
+    .await;
+    if let Err(e) = fetched {
+        if e.kind == ErrorKind::ConnectionLost {
+            // Nothing to do on this side: the sender reconnects and continues.
+            events(Event::ReceiveInterrupted { peer: label, done: job.progress.done(), total: totals.bytes });
+            return Ok(());
+        }
+        return Err(e);
     }
     job.live.finish();
     proto::write(&mut ctl_send, &Done { files: manifest.files.len() as u32 }).await?;
+    // Where each item is now, under the name it got here ("Album (2)").
+    let items: Vec<Placed> = manifest
+        .roots
+        .iter()
+        .map(|root| {
+            let name = rebase(&root.name, &renames);
+            let folder = job.storage.describe(&name);
+            Placed {
+                place: format!("{}/{name}", folder.trim_end_matches('/')),
+                path: job.storage.local_path(&name),
+                is_dir: root.is_dir,
+                name,
+            }
+        })
+        .collect();
+    // A sender from before this message has closed the stream by now; nothing is lost.
+    let _ = proto::write(&mut ctl_send, &Saved { places: items.iter().map(|i| i.place.clone()).collect() }).await;
     let _ = ctl_send.finish();
     let _ = tokio::time::timeout(Duration::from_secs(2), conn.closed()).await;
     if let Some(seen) = &opts.seen {
         seen(&sender, &device_name_offered);
     }
-    events(Event::Received { peer: label, totals, dest, secs: started.elapsed().as_secs_f64() });
+    events(Event::Received { peer: label, totals, dest, secs: started.elapsed().as_secs_f64(), items });
     Ok(())
 }
 
@@ -875,6 +917,10 @@ struct Progress {
 impl Progress {
     fn add(&self, n: u64) {
         self.done.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn done(&self) -> u64 {
+        self.done.load(Ordering::Relaxed)
     }
 
     fn sub(&self, n: u64) {

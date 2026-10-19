@@ -65,16 +65,19 @@ pub enum Event {
     ResumingSend { peer: String, files_done: usize, files: usize, bytes_left: u64 },
     /// Sending: the connection broke; trying again until it works or is cancelled.
     WaitingToResume { peer: String, files_done: usize, files: usize },
+    /// Receiving: the sender's connection dropped mid-transfer; it reconnects by itself.
+    ReceiveInterrupted { peer: String, done: u64, total: u64 },
     PairingPeer { peer: String, id: String },
     PairingWrongCode { peer: String },
     Paired { peer: String, ours: Remember, theirs: Remember },
     /// Sending: everything arrived and was verified.
     /// `via` names the mesh (Yggdrasil) if that is what carried the data at the end.
-    Finished { peer: String, totals: Totals, secs: f64, via: Option<&'static str> },
+    /// `saved`: where the receiver says it put each item, if it said.
+    Finished { peer: String, totals: Totals, secs: f64, via: Option<&'static str>, saved: Vec<String> },
     /// The connection moved to another route while the transfer ran.
     RouteChanged { peer: String, via: &'static str },
     /// Receiving: everything arrived and was verified.
-    Received { peer: String, totals: Totals, dest: String, secs: f64 },
+    Received { peer: String, totals: Totals, dest: String, secs: f64, items: Vec<Placed> },
     Failed(Error),
 }
 
@@ -127,9 +130,15 @@ impl fmt::Display for Event {
                 plural(*files, "file"),
                 human_bytes(*bytes_left)
             ),
+            Self::ReceiveInterrupted { peer, done, total } => write!(
+                f,
+                "Connection to {peer} lost with {} of {} here; it continues by itself when {peer} reconnects, nothing to do here",
+                human_bytes(*done),
+                human_bytes(*total)
+            ),
             Self::WaitingToResume { peer, files_done, files } => write!(
                 f,
-                "Connection to {peer} lost with {files_done} of {} done; waiting to resume (Ctrl-C stops)",
+                "Connection to {peer} lost with {files_done} of {} done; waiting to resume",
                 plural(*files, "file")
             ),
             Self::PairingPeer { peer, id } => write!(f, "{peer} ({id}) used the code; its key matches"),
@@ -149,7 +158,7 @@ impl fmt::Display for Event {
                     (_, Remember::Yes) => write!(f, ". {peer} remembers this device too"),
                 }
             }
-            Self::Finished { peer, totals, secs, via } => {
+            Self::Finished { peer, totals, secs, via, saved } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
                 let over = via.map(|v| format!(" over {v}")).unwrap_or_default();
                 write!(
@@ -159,14 +168,20 @@ impl fmt::Display for Event {
                     human_bytes(totals.bytes),
                     secs,
                     human_bytes(rate as u64)
-                )
+                )?;
+                if !saved.is_empty() {
+                    write!(f, "; saved on {peer} as {}", saved.join(", "))?;
+                }
+                Ok(())
             }
             Self::RouteChanged { peer, via } => write!(f, "The connection to {peer} moved to {via}"),
-            Self::Received { peer, totals, dest, secs } => {
+            Self::Received { peer, totals, dest, secs, items } => {
                 let rate = if *secs > 0.0 { totals.bytes as f64 / secs } else { 0.0 };
+                let places: Vec<&str> = items.iter().map(|i| i.place.as_str()).collect();
+                let at = if places.is_empty() { dest.clone() } else { places.join(", ") };
                 write!(
                     f,
-                    "{} from {peer} verified and saved to {dest} ({}, {:.1} s, {}/s)",
+                    "{} from {peer} verified; saved as {at} ({}, {:.1} s, {}/s)",
                     all_files(totals.files),
                     human_bytes(totals.bytes),
                     secs,
@@ -176,6 +191,18 @@ impl fmt::Display for Event {
             Self::Failed(e) => write!(f, "{} {}", e.kind.headline(), e.kind.next_step()),
         }
     }
+}
+
+/// One item of a received transfer and where it is now.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Placed {
+    /// The name it arrived under ("Album (2)" if "Album" was taken).
+    pub name: String,
+    pub is_dir: bool,
+    /// Where it is, as people say it: "~/Downloads/glft/Album".
+    pub place: String,
+    /// The same as a path on this device, if it has one, for "Show in folder".
+    pub path: Option<std::path::PathBuf>,
 }
 
 /// "14:03" today, "Mon 14:03" otherwise.

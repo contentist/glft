@@ -92,10 +92,7 @@ class ReceiveService : Service() {
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        glft.note(
-            "Receiving stopped: Android allows background receiving for 6 hours a day. Open glft to start it again.",
-            isError = true,
-        )
+        glft.fail("receive-time-limit", "onTimeout for the dataSync foreground service")
         stopSelf()
     }
 

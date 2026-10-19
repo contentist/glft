@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/glft-core", "crates/glft-cli", "crates/glft-engine", "crates/glft-ffi", "crates/glft-gtk"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 rust-version = "1.96"
@@ -11,7 +11,9 @@ rust-version = "1.96"
 [workspace.dependencies]
 glft-core = { path = "crates/glft-core" }
 glft-engine = { path = "crates/glft-engine" }
-iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+# Exact: glft's route selector (crates/glft-core/src/route.rs) uses an API iroh marks
+# unstable. Each iroh release: bump this, then rerun the route test (record 0006).
+iroh = { version = "=1.3.0", default-features = false, features = ["tls-ring", "unstable-custom-transports"] }
 iroh-mdns-address-lookup = "0.6"
 n0-future = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time", "signal"] }

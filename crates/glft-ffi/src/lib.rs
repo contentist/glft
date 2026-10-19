@@ -141,6 +141,25 @@ pub struct LogLine {
     /// For errors: the next step, and the raw detail for the expandable part.
     pub next_step: Option<String>,
     pub detail: Option<String>,
+    /// For errors: the catalogue id, which names its help page.
+    pub id: Option<String>,
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+impl LogLine {
+    fn failure(e: &Error) -> Self {
+        Self {
+            at_unix_ms: now_ms(),
+            sentence: e.kind.headline().into(),
+            is_error: true,
+            next_step: Some(e.kind.next_step().into()),
+            detail: Some(format!("[{}] {}", e.kind.id(), e.detail)),
+            id: Some(e.kind.id().into()),
+        }
+    }
 }
 
 /// An offer waiting for the person's answer.
@@ -159,8 +178,8 @@ pub trait NodeListener: Send + Sync {
     fn on_offer(&self, offer: OfferInfo);
     /// The offer no longer needs an answer: answered, or `missed` because the sender left.
     fn on_offer_closed(&self, id: u64, missed: bool);
-    /// Receiving ended, on request or because of `error`.
-    fn on_stopped(&self, error: Option<String>);
+    /// Receiving ended, on request or because of `error` (a log line to show).
+    fn on_stopped(&self, error: Option<LogLine>);
     /// Bytes verified so far in the transfer arriving now.
     fn on_progress(&self, done: u64, total: u64);
     /// A transfer arrived complete, every file verified.
@@ -411,7 +430,9 @@ pub struct Node {
     starting: Mutex<()>,
     pairing: Mutex<Option<pairing::Pending>>,
     /// Stops the send in progress.
-    cancel_send: Mutex<Option<oneshot::Sender<()>>>,
+    /// The send in progress, by a number of its own, so a send that ends late never
+    /// clears the cancel of the one after it.
+    cancel_send: Mutex<Option<(u64, oneshot::Sender<()>)>>,
 }
 
 #[uniffi::export]
@@ -421,6 +442,7 @@ impl Node {
     #[uniffi::constructor]
     pub fn new(data_dir: String, device_name: String) -> Result<Arc<Self>, GlftError> {
         glft_core::paths::set_device_name(device_name);
+        glft_core::error::set_surface(glft_core::error::Surface::Phone);
         let data_dir = PathBuf::from(data_dir);
         let (secret, _) = identity::load_or_create(&data_dir)?;
         // The Day 2 debug list of allowed keys is replaced by pairing.
@@ -474,7 +496,7 @@ impl Node {
         let ep = endpoint.clone();
         let task = runtime().spawn(async move {
             let result = transfer::serve(&ep, opts, &events).await;
-            listener.on_stopped(result.err().map(|e| e.kind.headline().to_string()));
+            listener.on_stopped(result.err().map(|e| LogLine::failure(&e)));
         });
         *self.running.lock().unwrap() = Some(Running { endpoint, task });
         Ok(())
@@ -582,7 +604,9 @@ impl Node {
             .collect();
         let events = sink(listener);
         let (cancel, cancelled) = oneshot::channel();
-        *self.cancel_send.lock().unwrap() = Some(cancel);
+        static NEXT_SEND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let this_send = NEXT_SEND.fetch_add(1, Ordering::Relaxed);
+        *self.cancel_send.lock().unwrap() = Some((this_send, cancel));
         let addrs = match route {
             Route::Auto => device.dial_addrs(),
             Route::Local => device.addrs.clone(),
@@ -614,7 +638,12 @@ impl Node {
             }
             result
         });
-        *self.cancel_send.lock().unwrap() = None;
+        {
+            let mut current = self.cancel_send.lock().unwrap();
+            if current.as_ref().is_some_and(|(n, _)| *n == this_send) {
+                *current = None;
+            }
+        }
         match result {
             Ok(delivered) => {
                 let _ = self.devices.lock().unwrap().seen(&id, None, delivered.addr.as_slice());
@@ -627,7 +656,7 @@ impl Node {
     /// Stops the send in progress, if any. What already arrived is kept, and sending the
     /// same files again continues from there.
     pub fn cancel_send(&self) {
-        if let Some(cancel) = self.cancel_send.lock().unwrap().take() {
+        if let Some((_, cancel)) = self.cancel_send.lock().unwrap().take() {
             let _ = cancel.send(());
         }
     }
@@ -740,7 +769,7 @@ fn explain_network(e: Error) -> Error {
 
 fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
     Arc::new(move |event: Event| {
-        let at_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+        let at_unix_ms = now_ms();
         if let Event::Progress { done, total, .. } = event {
             listener.on_progress(done, total);
             return;
@@ -758,18 +787,21 @@ fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
                 dest: dest.clone(),
             });
         }
-        let (is_error, next_step, detail) = match &event {
-            Event::Failed(e) => (true, Some(e.kind.next_step().to_string()), Some(format!("[{}] {}", e.kind.id(), e.detail))),
-            _ => (false, None, None),
-        };
+        // The bar for a transfer that stopped arriving; it comes back when it resumes.
+        if matches!(event, Event::ReceiveInterrupted { .. }) {
+            listener.on_progress(0, 0);
+        }
+        if let Event::Failed(e) = &event {
+            listener.on_log(LogLine { at_unix_ms, ..LogLine::failure(e) });
+            return;
+        }
         let sentence = match &event {
-            Event::Failed(e) => e.kind.headline().to_string(),
             Event::ViaMesh { mesh, .. } if LAN_BLOCKED.load(Ordering::Relaxed) => {
                 format!("The local network is blocked by a VPN (lockdown); sending over {mesh} instead")
             }
             _ => event.to_string(),
         };
-        listener.on_log(LogLine { at_unix_ms, sentence, is_error, next_step, detail });
+        listener.on_log(LogLine { at_unix_ms, sentence, is_error: false, next_step: None, detail: None, id: None });
     })
 }
 
@@ -840,6 +872,23 @@ fn bench(storage: &dyn ReceiveStorage, files: u32, size: u32) -> Result<String, 
 #[uniffi::export]
 pub fn core_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+/// A log line for an error the app itself found, from the catalogue: `id` names the
+/// kind (e.g. "send-already-running"), `detail` is the raw part shown on request.
+#[uniffi::export]
+pub fn error_line(id: String, detail: String) -> LogLine {
+    match ErrorKind::from_id(&id) {
+        Some(kind) => LogLine::failure(&Error::new(kind, detail)),
+        // A typo in the app: still say something rather than nothing.
+        None => LogLine { at_unix_ms: now_ms(), sentence: detail.clone(), is_error: true, next_step: None, detail: Some(format!("[{id}] {detail}")), id: None },
+    }
+}
+
+/// The help page for an error id (or another topic), as Markdown; built into the app.
+#[uniffi::export]
+pub fn help_page(id: String) -> Option<String> {
+    glft_core::help::page(&id).map(String::from)
 }
 
 /// The default receive folder name under Download.

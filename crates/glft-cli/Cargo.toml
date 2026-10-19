@@ -22,3 +22,6 @@ xattr.workspace = true
 blake3.workspace = true
 walkdir.workspace = true
 
+
+[dev-dependencies]
+tempfile.workspace = true

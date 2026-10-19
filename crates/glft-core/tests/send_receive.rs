@@ -135,6 +135,13 @@ async fn folder_arrives_verified_with_structure() {
     assert_eq!(String::from_utf8(mark).unwrap(), expected, "received files carry their fingerprint");
     let tx_log = tx_log.lock().unwrap().join("\n");
     assert!(tx_log.contains("All 5 files verified"), "{tx_log}");
+
+    // The sender is told where everything went, under the names it got there.
+    let album_place = format!("{}/Album (2)", dest.path().display());
+    let notes_place = format!("{}/notes.txt", dest.path().display());
+    assert_eq!(delivered.saved, [album_place.clone(), notes_place.clone()]);
+    assert!(tx_log.contains("saved on") && tx_log.contains(&album_place), "{tx_log}");
+    assert!(rx_log.contains(&format!("saved as {album_place}, {notes_place}")), "{rx_log}");
 }
 
 #[tokio::test]

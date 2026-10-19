@@ -6,6 +6,8 @@
 
 pub mod devices;
 pub mod error;
+pub mod help;
+pub mod route;
 pub mod events;
 pub mod identity;
 pub mod manifest;

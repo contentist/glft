@@ -40,6 +40,20 @@ use tokio::{
 
 const RECENT_LINES: usize = 500;
 
+/// The log on disk, in the data folder: one JSON line per entry.
+const LOG_FILE: &str = "log.jsonl";
+const LOG_FILE_MAX: u64 = 1 << 20;
+
+/// The last [`RECENT_LINES`] lines an earlier engine wrote.
+fn earlier_log(data_dir: &std::path::Path) -> VecDeque<LogLine> {
+    let text = std::fs::read_to_string(data_dir.join(LOG_FILE)).unwrap_or_default();
+    let mut lines: VecDeque<LogLine> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    while lines.len() > RECENT_LINES {
+        lines.pop_front();
+    }
+    lines
+}
+
 /// With nothing to do for this long (no client connected, receiving off, no send, no
 /// offer), the engine exits; the next client starts it again. Overridden in seconds by
 /// `GLFT_IDLE_SECS` (0: never).
@@ -78,6 +92,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), Error> {
     let listener = listen().await?;
     let data_dir = paths::data_dir()?;
+    let recent = earlier_log(&data_dir);
     let (secret, created) = identity::load_or_create(&data_dir)?;
     let devices = DeviceStore::load(&data_dir)?;
     let engine = Arc::new(Engine {
@@ -85,7 +100,7 @@ async fn run() -> Result<(), Error> {
         data_dir,
         devices: Arc::new(Mutex::new(devices)),
         log: broadcast::channel(1024).0,
-        recent: Mutex::new(VecDeque::new()),
+        recent: Mutex::new(recent),
         receiving: tokio::sync::Mutex::new(None),
         offers: Default::default(),
         next_offer: AtomicU64::new(1),
@@ -230,13 +245,14 @@ fn line(event: &Event) -> LogLine {
             is_error: true,
             next_step: Some(e.kind.next_step().into()),
             detail: Some(format!("[{}] {}", e.kind.id(), e.detail)),
+            id: Some(e.kind.id().into()),
         },
         _ => note(&event.to_string()),
     }
 }
 
 fn note(sentence: &str) -> LogLine {
-    LogLine { at_unix_ms: now_ms(), sentence: sentence.into(), is_error: false, next_step: None, detail: None }
+    LogLine { at_unix_ms: now_ms(), sentence: sentence.into(), is_error: false, next_step: None, detail: None, id: None }
 }
 
 /// Replies for one client; dropped messages just mean the client has gone.
@@ -288,6 +304,9 @@ impl Engine {
                 notify::received(peer, &totals.to_string(), dest);
                 self.incoming.lock().unwrap().remove(peer);
             }
+            Event::ReceiveInterrupted { peer, .. } => {
+                self.incoming.lock().unwrap().remove(peer);
+            }
             Event::Progress { peer, done, total } => {
                 let i = Incoming { peer: peer.clone(), done: *done, total: *total };
                 self.incoming.lock().unwrap().insert(peer.clone(), (i, Instant::now()));
@@ -296,12 +315,7 @@ impl Engine {
         }
         if let Reply::Line(l) = &reply {
             println!("{}", l.sentence);
-            let mut recent = self.recent.lock().unwrap();
-            recent.push_back(l.clone());
-            while recent.len() > RECENT_LINES {
-                recent.pop_front();
-            }
-            drop(recent);
+            self.remember(l);
             self.changed();
         }
         let _ = self.log.send(reply);
@@ -310,9 +324,33 @@ impl Engine {
     fn log_note(&self, sentence: &str) {
         let l = note(sentence);
         println!("{sentence}");
-        self.recent.lock().unwrap().push_back(l.clone());
+        self.remember(&l);
         let _ = self.log.send(Reply::Line(l));
         self.changed();
+    }
+
+    /// Keeps a log line for `glft log` and windows: in memory, and on disk so the log
+    /// outlives the engine stopping when nothing needs it.
+    fn remember(&self, l: &LogLine) {
+        let mut recent = self.recent.lock().unwrap();
+        recent.push_back(l.clone());
+        while recent.len() > RECENT_LINES {
+            recent.pop_front();
+        }
+        let path = self.data_dir.join(LOG_FILE);
+        if let Ok(mut line) = serde_json::to_vec(l) {
+            line.push(b'\n');
+            use std::io::Write;
+            let appended = std::fs::OpenOptions::new().create(true).append(true).open(&path).and_then(|mut f| f.write_all(&line));
+            // Cut back to the recent lines now and then, so the file stays small.
+            if appended.is_ok() && std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_FILE_MAX) {
+                let kept: Vec<u8> = recent.iter().filter_map(|l| serde_json::to_vec(l).ok()).flat_map(|mut v| { v.push(b'\n'); v }).collect();
+                let temp = path.with_extension("jsonl.new");
+                if std::fs::write(&temp, kept).is_ok() {
+                    let _ = std::fs::rename(&temp, &path);
+                }
+            }
+        }
     }
 
     /// Tells watching windows to fetch status and devices again.

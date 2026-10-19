@@ -74,6 +74,10 @@ fun LogRow(line: LogLine, expandable: Boolean = false) {
         Column {
             Text(line.sentence, style = MaterialTheme.typography.bodyMedium, color = color)
             line.nextStep?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            if (line.isError && HelpActivity.has(line.id)) {
+                val context = LocalContext.current
+                TextButton(onClick = { HelpActivity.open(context, line.id!!) }) { Text("Help") }
+            }
             if (open) {
                 line.detail?.let { Text("Details: $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             } else if (line.detail != null) {

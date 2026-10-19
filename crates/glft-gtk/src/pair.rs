@@ -143,7 +143,7 @@ impl PairDialog {
         let head = label(&e.headline);
         head.add_css_class("error");
         self.body.append(&head);
-        self.body.append(&label(&format!("What to do: {}", e.next_step)));
+        self.body.append(&label(&format!("What to do: {}", crate::next_step(&e.id, &e.next_step))));
         let detail = dim(&format!("[{}] {}", e.id, e.detail));
         detail.set_selectable(true);
         self.body.append(&detail);

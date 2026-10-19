@@ -19,7 +19,11 @@ struct Engine {
 
 impl Engine {
     fn start(name: &str, idle_secs: f64) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(tempfile::tempdir().unwrap(), name, idle_secs)
+    }
+
+    /// An engine using `dir` for its folders, e.g. one an earlier engine used.
+    fn start_in(dir: tempfile::TempDir, name: &str, idle_secs: f64) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_glftd"))
             .env(glft_engine::RUNTIME_DIR_ENV, dir.path().join("run"))
             .env(glft_core::paths::DATA_DIR_ENV, dir.path().join("data"))
@@ -106,6 +110,18 @@ async fn an_engine_nothing_needs_exits() {
     let mut e = Engine::start("Idle", 1.0);
     e.status().await;
     assert!(e.exits_within(Duration::from_secs(5)), "the engine kept running with nothing to do");
+}
+
+#[tokio::test]
+async fn the_log_outlives_the_engine() {
+    let mut e = Engine::start("Idle", 1.0);
+    e.status().await;
+    assert!(e.exits_within(Duration::from_secs(5)));
+    // Take the folder over for a second engine.
+    let dir = std::mem::replace(&mut e.dir, tempfile::tempdir().unwrap());
+    drop(e);
+    let again = Engine::start_in(dir, "Idle", 0.0);
+    assert!(again.log().await.iter().any(|l| l.starts_with("Nothing needs the engine now")), "the earlier engine's log is gone");
 }
 
 #[tokio::test]

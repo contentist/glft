@@ -121,7 +121,34 @@ fn engine_build_id() -> Option<String> {
     Some(format!("{} {secs}", env!("CARGO_PKG_VERSION")))
 }
 
+/// Set (to anything) to keep systemd out of it: the engine is started as a plain process
+/// and no units are written. For tests, which must not touch the user's own setup.
+pub const NO_SYSTEMD_ENV: &str = "GLFT_NO_SYSTEMD";
+
+/// Whether glft was installed by a package (into /usr), which brings its own units, menu
+/// entry and Nemo action.
+pub fn system_install() -> bool {
+    std::env::current_exe().is_ok_and(|p| p.starts_with("/usr/"))
+}
+
+/// Runs `systemctl --user ARGS` quietly; false if it failed or systemd is kept out.
+pub fn systemctl(args: &[&str]) -> bool {
+    if std::env::var_os(NO_SYSTEMD_ENV).is_some() {
+        return false;
+    }
+    std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 fn systemd_user_available() -> bool {
+    if std::env::var_os(NO_SYSTEMD_ENV).is_some() {
+        return false;
+    }
     std::process::Command::new("systemctl")
         .args(["--user", "show-environment"])
         .stdout(std::process::Stdio::null())
@@ -160,11 +187,21 @@ pub fn start_engine(on_setup: impl FnOnce(&std::path::Path)) -> Result<()> {
 }
 
 /// Writes the systemd user units if they are missing or point at another `glftd`.
-/// Returns whether anything changed.
+/// Returns whether anything changed. A package install has its units in /usr already.
 pub fn install_units() -> Result<bool> {
+    if system_install() {
+        return Ok(false);
+    }
+    install_units_for(&std::fs::canonicalize(engine_path()).unwrap_or_else(|_| engine_path()))
+}
+
+/// Writes the systemd user units for the engine at `engine`.
+pub fn install_units_for(engine: &std::path::Path) -> Result<bool> {
+    if std::env::var_os(NO_SYSTEMD_ENV).is_some() {
+        return Ok(false);
+    }
     let dir = crate::unit_dir().map_err(local)?;
-    let engine = std::fs::canonicalize(engine_path()).unwrap_or_else(|_| engine_path());
-    let units = [("glft.socket", crate::SOCKET_UNIT.to_string()), ("glft.service", crate::service_unit(&engine))];
+    let units = [("glft.socket", crate::SOCKET_UNIT.to_string()), ("glft.service", crate::service_unit(engine))];
     let mut changed = false;
     for (name, content) in &units {
         let path = dir.join(name);
@@ -175,9 +212,8 @@ pub fn install_units() -> Result<bool> {
         }
     }
     if changed {
-        let systemctl = |args: &[&str]| std::process::Command::new("systemctl").arg("--user").args(args).status();
-        let _ = systemctl(&["daemon-reload"]);
-        let _ = systemctl(&["enable", "glft.socket"]);
+        systemctl(&["daemon-reload"]);
+        systemctl(&["enable", "glft.socket"]);
     }
     Ok(changed)
 }

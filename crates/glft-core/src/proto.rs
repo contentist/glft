@@ -52,6 +52,14 @@ pub struct Done {
     pub files: u32,
 }
 
+/// Sent by the receiver after [`Done`]: where each offered item was saved, in the order of
+/// the manifest's roots, as the receiver describes it ("~/Downloads/glft/Album"), so the
+/// sender can say where the files went. A sender from before this message never reads it.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Saved {
+    pub places: Vec<String>,
+}
+
 pub async fn write<T: Serialize>(stream: &mut (impl AsyncWrite + Unpin), msg: &T) -> Result<(), Error> {
     let bytes = postcard::to_stdvec(msg).map_err(|e| Error::new(ErrorKind::ProtocolError, e.to_string()))?;
     let len = u32::try_from(bytes.len())

@@ -33,6 +33,12 @@
             </intent-filter>
         </activity>
 
+        <!-- A help page, opened from an error's Help button. -->
+        <activity
+            android:name=".HelpActivity"
+            android:exported="false"
+            android:label="@string/app_name" />
+
         <!-- In every app's Share menu, for one file or many. -->
         <activity
             android:name=".ShareActivity"

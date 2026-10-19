@@ -149,7 +149,7 @@ private fun Screen() {
             try {
                 choosing = withContext(Dispatchers.IO) { read() }
             } catch (e: Exception) {
-                app.note("Couldn't read what you picked: ${e.message}", isError = true)
+                app.fail("source-unreadable", e.message ?: e.toString())
             }
         }
     }
@@ -426,6 +426,7 @@ private fun VpnLockdownCard(devices: List<uniffi.glft_ffi.PairedDevice>) {
                 },
             )
             OutlinedButton(onClick = { context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS)) }) { Text("Open VPN settings") }
+            TextButton(onClick = { HelpActivity.open(context, "vpn-lockdown") }) { Text("Help") }
         }
     }
 }

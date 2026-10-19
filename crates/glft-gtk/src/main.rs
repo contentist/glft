@@ -4,6 +4,7 @@
 //! after one more click, so a mis-click sends nothing.
 
 mod bridge;
+mod help;
 mod pair;
 
 use std::{
@@ -34,6 +35,7 @@ const CSS: &str = "
 ";
 
 fn main() -> glib::ExitCode {
+    glft_core::error::set_surface(glft_core::error::Surface::Window);
     let app = gtk::Application::builder().application_id(APP_ID).flags(gio::ApplicationFlags::HANDLES_OPEN).build();
     let ui: Rc<RefCell<Option<Rc<Ui>>>> = Rc::default();
 
@@ -89,6 +91,9 @@ pub struct Ui {
     banner_head: gtk::Label,
     banner_next: gtk::Label,
     banner_detail: gtk::Label,
+    /// The error shown in the banner, for its Help button.
+    banner_id: RefCell<String>,
+    banner_help: gtk::Button,
 
     receive_switch: gtk::Switch,
     receive_label: gtk::Label,
@@ -190,12 +195,16 @@ impl Ui {
         banner_detail.set_selectable(true);
         let details = gtk::Expander::new(Some("Details"));
         details.set_child(Some(&banner_detail));
+        let banner_buttons = hbox(8);
+        banner_buttons.set_halign(gtk::Align::End);
+        let banner_help = gtk::Button::with_mnemonic("_Help");
         let dismiss = gtk::Button::with_label("Dismiss");
-        dismiss.set_halign(gtk::Align::End);
+        banner_buttons.append(&banner_help);
+        banner_buttons.append(&dismiss);
         banner.append(&banner_head);
         banner.append(&banner_next);
         banner.append(&details);
-        banner.append(&dismiss);
+        banner.append(&banner_buttons);
         banner.set_visible(false);
         content.append(&banner);
 
@@ -295,6 +304,8 @@ impl Ui {
             banner_head,
             banner_next,
             banner_detail,
+            banner_id: RefCell::default(),
+            banner_help,
             receive_switch,
             receive_label,
             receive_addrs,
@@ -319,6 +330,8 @@ impl Ui {
         // ---- controls
         let u = ui.clone();
         dismiss.connect_clicked(move |_| u.banner.set_visible(false));
+        let u = ui.clone();
+        ui.banner_help.connect_clicked(move |_| help::show(&u.window, &u.banner_id.borrow()));
 
         let u = ui.clone();
         ui.receive_switch.connect_state_set(move |_, on| {
@@ -396,8 +409,10 @@ impl Ui {
 
     fn show_error(&self, e: &ErrorInfo) {
         self.banner_head.set_text(&e.headline);
-        self.banner_next.set_text(&format!("What to do: {}", e.next_step));
+        self.banner_next.set_text(&format!("What to do: {}", next_step(&e.id, &e.next_step)));
         self.banner_detail.set_text(&format!("[{}] {}", e.id, e.detail));
+        *self.banner_id.borrow_mut() = e.id.clone();
+        self.banner_help.set_visible(glft_core::help::page(&e.id).is_some());
         self.banner.set_visible(true);
     }
 
@@ -630,7 +645,7 @@ impl Ui {
             if l.is_error {
                 sentence.add_css_class("error");
                 if let Some(n) = &l.next_step {
-                    text.append(&label(&format!("What to do: {n}")));
+                    text.append(&label(&format!("What to do: {}", next_step(l.id.as_deref().unwrap_or_default(), n))));
                 }
                 if let Some(d) = &l.detail {
                     let more = gtk::Expander::new(Some("Details"));
@@ -638,6 +653,14 @@ impl Ui {
                     detail.set_selectable(true);
                     more.set_child(Some(&detail));
                     text.append(&more);
+                }
+                if let Some(id) = l.id.clone().filter(|id| glft_core::help::page(id).is_some()) {
+                    let help = gtk::Button::with_label("Help");
+                    help.add_css_class("flat");
+                    help.set_halign(gtk::Align::Start);
+                    let window = self.window.clone();
+                    help.connect_clicked(move |_| help::show(&window, &id));
+                    text.append(&help);
                 }
             }
             text.set_hexpand(true);
@@ -676,12 +699,7 @@ impl Ui {
             }
         }
         if !not_local.is_empty() {
-            self.show_error(&ErrorInfo {
-                id: "not-a-local-file".into(),
-                headline: "Some of these aren't files on this computer, so glft can't send them.".into(),
-                next_step: "Copy them to a folder on this computer first, then send them from there.".into(),
-                detail: not_local.join(", "),
-            });
+            self.show_error(&ErrorInfo::from(&glft_core::Error::new(glft_core::ErrorKind::NotALocalFile, not_local.join(", "))));
         }
         if paths.is_empty() {
             return;
@@ -746,6 +764,15 @@ impl Ui {
         });
         *self.pair.borrow_mut() = Some(dialog);
         let _ = self.cmd.send(Cmd::Pair { code: None });
+    }
+}
+
+/// The next step for this window: the engine words it for the terminal, so it is looked
+/// up again by the error's id; `given` is kept for an id this build doesn't know.
+fn next_step<'a>(id: &str, given: &'a str) -> &'a str {
+    match glft_core::ErrorKind::from_id(id) {
+        Some(kind) => kind.next_step(),
+        None => given,
     }
 }
 

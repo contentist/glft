@@ -127,6 +127,10 @@ pub struct LogLine {
     pub is_error: bool,
     pub next_step: Option<String>,
     pub detail: Option<String>,
+    /// An error's catalogue id, so a window can word the next step for itself and link
+    /// its help page.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

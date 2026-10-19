@@ -20,6 +20,7 @@ import uniffi.glft_ffi.PairedDevice
 import uniffi.glft_ffi.ReceivedInfo
 import uniffi.glft_ffi.Route
 import uniffi.glft_ffi.StorageChoice
+import uniffi.glft_ffi.errorLine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -100,7 +101,13 @@ class GlftApp : Application() {
         _sendState.value = SendState.Running(device.name, outgoing.summary, 0, outgoing.bytes)
     }
 
-    fun takeQueuedSend(): QueuedSend? = queuedSend.also { queuedSend = null }
+    /** The send the job is to run. It stays until the send ends, so a job Android stops
+     *  and runs again (after a network change) continues with the same files. */
+    fun queuedSend(): QueuedSend? = queuedSend
+
+    fun clearQueuedSend() {
+        queuedSend = null
+    }
 
     private val _net = MutableStateFlow(NetState())
     val net: StateFlow<NetState> = _net
@@ -241,10 +248,14 @@ class GlftApp : Application() {
 
     /** Logs an error from the core with its next step and raw detail. */
     fun fail(e: uniffi.glft_ffi.GlftException.Failed) =
-        append(LogLine(System.currentTimeMillis(), e.headline, true, e.nextStep, "[${e.id}] ${e.detail}"))
+        append(LogLine(System.currentTimeMillis(), e.headline, true, e.nextStep, "[${e.id}] ${e.detail}", e.id))
 
-    fun note(sentence: String, isError: Boolean = false) =
-        append(LogLine(System.currentTimeMillis(), sentence, isError, null, null))
+    /** Logs an error the app found itself, worded by the catalogue: [id] names its kind
+     *  (and help page), [detail] is the raw part shown on request. */
+    fun fail(id: String, detail: String = "") = append(errorLine(id, detail))
+
+    fun note(sentence: String) =
+        append(LogLine(System.currentTimeMillis(), sentence, false, null, null, null))
 
     private fun append(line: LogLine) {
         // Debug builds also copy the log to logcat, so tests over adb can time events.
@@ -279,10 +290,10 @@ class GlftApp : Application() {
             if (missed && offer != null) Notifications.showMissed(this@GlftApp, offer)
         }
 
-        override fun onStopped(error: String?) {
+        override fun onStopped(error: LogLine?) {
             _receiving.value = false
             _progress.value = null
-            if (error != null) note(error, isError = true)
+            if (error != null) append(error)
         }
 
         override fun onProgress(done: ULong, total: ULong) {

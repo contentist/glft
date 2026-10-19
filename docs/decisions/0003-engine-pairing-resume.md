@@ -83,7 +83,7 @@ seconds. The phone answered that packet straight away. So:
 - **The laptop's Wi-Fi froze during transfers.** The Realtek RTL8852BE driver fails to set
   up TDLS direct links to the phone and stalls its transmit queues. Each test transfer set
   off a failed TDLS attempt and a stall; with TDLS switched off (see
-  `docs/troubleshooting.md`) the next test had none. This is a driver problem any large
+  `docs/help/wifi-freezes.md`) the next test had none. This is a driver problem any large
   local copy can trigger, not a glft one.
 - **The router's 5 GHz radio is unreliable** in this test setup, so all tests ran on
   2.4 GHz: about 5–8 MB/s phone transfer speed.

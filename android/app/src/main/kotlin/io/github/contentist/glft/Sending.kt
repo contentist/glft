@@ -142,7 +142,7 @@ object Sends {
     fun start(context: Context, device: PairedDevice, outgoing: Outgoing, route: Route): Boolean {
         val app = context.glft
         if (app.sendState.value is SendState.Running) {
-            app.note("A send is already running; wait for it to finish or cancel it first", isError = true)
+            app.fail("send-already-running")
             return false
         }
         app.queueSend(device, outgoing, route)
@@ -166,7 +166,7 @@ object Sends {
             val how = if (route == Route.MESH) " over ${device.mesh ?: "the mesh"}" else ""
             Toast.makeText(context, "Sending to ${device.name}$how…", Toast.LENGTH_SHORT).show()
         } else {
-            app.note("Android refused to start the send", isError = true)
+            app.fail("send-not-started", "JobScheduler refused the job")
         }
         return scheduled
     }

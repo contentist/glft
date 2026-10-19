@@ -1,6 +1,6 @@
-# Troubleshooting
+# The computer's Wi-Fi freezes during transfers
 
-## The laptop's Wi-Fi freezes during transfers (Realtek RTL8852BE)
+Seen on computers with a Realtek RTL8852BE Wi-Fi chip.
 
 **What you see:** while glft sends to your phone, web pages on the laptop stop loading for
 a while, or other network programs drop their connections. The transfer itself may slow

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 iroh.workspace = true
+libc.workspace = true
 iroh-mdns-address-lookup.workspace = true
 tokio.workspace = true
 blake3.workspace = true

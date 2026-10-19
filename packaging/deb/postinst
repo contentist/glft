@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    # Each user's engine socket starts at their next login; nothing listens on the
+    # network until they switch receiving on. `glft` starts it sooner when needed.
+    systemctl --global enable glft.socket >/dev/null 2>&1 || true
+    command -v update-desktop-database >/dev/null && update-desktop-database -q /usr/share/applications || true
+    command -v gtk-update-icon-cache >/dev/null && gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+fi

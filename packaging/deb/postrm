@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+case "$1" in
+remove)
+    systemctl --global disable glft.socket >/dev/null 2>&1 || true
+    ;;
+purge)
+    systemctl --global disable glft.socket >/dev/null 2>&1 || true
+    echo "glft: each user's key and pairings stay in their ~/.local/share/glft;"
+    echo "      remove that folder to forget them. Received files are not touched."
+    ;;
+esac

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Stops every running glft engine before the package's files are removed or replaced
+# (design rule 4: no copy keeps running from files that are gone or half replaced).
+set -e
+
+case "$1" in
+remove|upgrade|deconfigure|failed-upgrade) ;;
+*) exit 0 ;;
+esac
+
+engines() {
+    for exe in /proc/[0-9]*/exe; do
+        case "$(readlink "$exe" 2>/dev/null)" in
+        /usr/bin/glftd|"/usr/bin/glftd (deleted)") pid=${exe#/proc/}; echo "${pid%/exe}" ;;
+        esac
+    done
+}
+
+# Each logged-in user's socket would otherwise start a new engine on the next request.
+if [ "$1" = remove ] && command -v loginctl >/dev/null; then
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+        user=$(id -nu "$uid" 2>/dev/null) || continue
+        systemctl --user -M "$user@" stop glft.socket >/dev/null 2>&1 || true
+    done
+fi
+
+pids=$(engines)
+[ -n "$pids" ] || exit 0
+echo "glft: stopping the running engine ($pids) before its files change"
+kill -TERM $pids 2>/dev/null || true
+i=0
+while [ $i -lt 50 ]; do
+    [ -n "$(engines)" ] || exit 0
+    sleep 0.1
+    i=$((i + 1))
+done
+left=$(engines)
+echo "glft: the engine ($left) didn't stop within 5 seconds and was killed"
+kill -KILL $left 2>/dev/null || true

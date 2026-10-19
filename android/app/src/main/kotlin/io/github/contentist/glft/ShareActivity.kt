@@ -11,6 +11,7 @@ import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -37,6 +38,8 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import uniffi.glft_ffi.LogLine
+import uniffi.glft_ffi.errorLine
 
 /**
  * glft in Android's Share menu: one file or many. A sheet shows what is being sent and the
@@ -76,22 +79,22 @@ private fun ShareSheet(uris: List<Uri>, onDone: () -> Unit) {
     val app = context.glft
     val devices by app.devices.collectAsStateWithLifecycle()
     var outgoing by remember { mutableStateOf<Outgoing?>(null) }
-    var problem by remember { mutableStateOf<String?>(null) }
+    var problem by remember { mutableStateOf<LogLine?>(null) }
     LaunchedEffect(uris) {
         app.refreshDevices()
         if (uris.isEmpty()) {
-            problem = "glft sends files. Sharing text or links isn't possible yet."
+            problem = errorLine("text-not-supported", "the share had no files (EXTRA_STREAM empty)")
             return@LaunchedEffect
         }
         try {
             outgoing = withContext(Dispatchers.IO) { context.contentResolver.outgoingFiles(uris) }
         } catch (e: Exception) {
-            problem = "glft couldn't read what was shared: ${e.message}"
+            problem = errorLine("source-unreadable", e.message ?: e.toString())
         }
     }
     when {
         problem != null -> Message(problem!!, onDone)
-        app.sendState.value is SendState.Running -> Message("A send is already running. Wait for it to finish, or cancel it in glft, then share again.", onDone)
+        app.sendState.value is SendState.Running -> Message(errorLine("send-already-running", ""), onDone)
         outgoing == null -> Card(Modifier.fillMaxWidth()) {
             Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
         }
@@ -100,7 +103,7 @@ private fun ShareSheet(uris: List<Uri>, onDone: () -> Unit) {
             devices = devices,
             onSend = { device, route ->
                 if (!networkAllowed()) {
-                    problem = "Network access is off for glft, so it can't reach your computer. Turn it on in Settings, Apps, glft, Permissions, Network."
+                    problem = errorLine("network-denied", "the Network permission is off for glft")
                 } else {
                     Sends.start(context, device, outgoing!!, route)
                     onDone()
@@ -111,12 +114,20 @@ private fun ShareSheet(uris: List<Uri>, onDone: () -> Unit) {
     }
 }
 
+/** An error from the catalogue: what happened, and what to do. */
 @Composable
-private fun Message(text: String, onDone: () -> Unit) {
+private fun Message(line: LogLine, onDone: () -> Unit) {
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(text)
-            Button(onClick = onDone) { Text("OK") }
+            Text(line.sentence, style = MaterialTheme.typography.titleSmall)
+            line.nextStep?.let { Text("What to do: $it") }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onDone) { Text("OK") }
+                if (HelpActivity.has(line.id)) {
+                    val context = LocalContext.current
+                    TextButton(onClick = { HelpActivity.open(context, line.id!!) }) { Text("Help") }
+                }
+            }
         }
     }
 }

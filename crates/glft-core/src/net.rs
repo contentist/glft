@@ -118,6 +118,8 @@ fn builder(secret: SecretKey, port: u16, alpn: &[u8]) -> Result<iroh::endpoint::
         .alpns(vec![alpn.to_vec()])
         .transport_config(transport)
         .relay_mode(RelayMode::Disabled)
+        // The local network over a tunnel such as Yggdrasil, whatever iroh's RTT says.
+        .path_selector(std::sync::Arc::new(crate::route::LocalFirst))
         .clear_ip_transports()
         .bind_addr((Ipv4Addr::UNSPECIFIED, port))?
         .bind_addr_with_opts(

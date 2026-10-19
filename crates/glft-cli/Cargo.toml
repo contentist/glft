@@ -21,6 +21,7 @@ qrcode.workspace = true
 xattr.workspace = true
 blake3.workspace = true
 walkdir.workspace = true
+libc.workspace = true
 
 
 [dev-dependencies]

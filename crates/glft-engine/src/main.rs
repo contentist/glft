@@ -30,7 +30,7 @@ use glft_core::{
     storage::FsStorage,
     transfer::{self, Authorize, Decide, IncomingOffer, ReceiveOptions, Seen},
 };
-use glft_engine::{Conn, DeviceInfo, ErrorInfo, Incoming, LogLine, OfferInfo, PING_LIMIT, Receiving, Reply, Request, SendInfo, Status, read_line, write_line};
+use glft_engine::{Arrival, Conn, DeviceInfo, ErrorInfo, Incoming, LogLine, OfferInfo, PING_LIMIT, Receiving, Reply, Request, SendInfo, Status, read_line, write_line};
 use iroh::{Endpoint, SecretKey};
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -43,6 +43,14 @@ const RECENT_LINES: usize = 500;
 /// The log on disk, in the data folder: one JSON line per entry.
 const LOG_FILE: &str = "log.jsonl";
 const LOG_FILE_MAX: u64 = 1 << 20;
+
+/// Recent arrivals, for the window's Received list; kept on disk like the log.
+const ARRIVALS_FILE: &str = "arrivals.json";
+const ARRIVALS_KEPT: usize = 20;
+
+fn earlier_arrivals(data_dir: &std::path::Path) -> VecDeque<Arrival> {
+    std::fs::read(data_dir.join(ARRIVALS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
 
 /// The last [`RECENT_LINES`] lines an earlier engine wrote.
 fn earlier_log(data_dir: &std::path::Path) -> VecDeque<LogLine> {
@@ -93,6 +101,7 @@ async fn run() -> Result<(), Error> {
     let listener = listen().await?;
     let data_dir = paths::data_dir()?;
     let recent = earlier_log(&data_dir);
+    let arrivals = earlier_arrivals(&data_dir);
     let (secret, created) = identity::load_or_create(&data_dir)?;
     let devices = DeviceStore::load(&data_dir)?;
     let engine = Arc::new(Engine {
@@ -101,6 +110,7 @@ async fn run() -> Result<(), Error> {
         devices: Arc::new(Mutex::new(devices)),
         log: broadcast::channel(1024).0,
         recent: Mutex::new(recent),
+        arrivals: Mutex::new(arrivals),
         receiving: tokio::sync::Mutex::new(None),
         offers: Default::default(),
         next_offer: AtomicU64::new(1),
@@ -205,6 +215,8 @@ struct Engine {
     devices: Arc<Mutex<DeviceStore>>,
     log: broadcast::Sender<Reply>,
     recent: Mutex<VecDeque<LogLine>>,
+    /// Newest first.
+    arrivals: Mutex<VecDeque<Arrival>>,
     receiving: tokio::sync::Mutex<Option<ReceivingState>>,
     offers: Arc<Mutex<BTreeMap<u64, PendingOffer>>>,
     next_offer: AtomicU64,
@@ -300,9 +312,10 @@ impl Engine {
 
     fn publish_as(&self, event: &Event, reply: Reply) {
         match event {
-            Event::Received { peer, totals, dest, .. } => {
-                notify::received(peer, &totals.to_string(), dest);
+            Event::Received { peer, totals, items, .. } => {
+                notify::received(peer, totals, items);
                 self.incoming.lock().unwrap().remove(peer);
+                self.arrived(Arrival { at_unix_ms: now_ms(), peer: peer.clone(), summary: totals.to_string(), items: items.clone() });
             }
             Event::ReceiveInterrupted { peer, .. } => {
                 self.incoming.lock().unwrap().remove(peer);
@@ -327,6 +340,19 @@ impl Engine {
         self.remember(&l);
         let _ = self.log.send(Reply::Line(l));
         self.changed();
+    }
+
+    fn arrived(&self, arrival: Arrival) {
+        let mut arrivals = self.arrivals.lock().unwrap();
+        arrivals.push_front(arrival);
+        arrivals.truncate(ARRIVALS_KEPT);
+        let path = self.data_dir.join(ARRIVALS_FILE);
+        let temp = path.with_extension("json.new");
+        if let Ok(json) = serde_json::to_vec_pretty(&*arrivals)
+            && std::fs::write(&temp, json).is_ok()
+        {
+            let _ = std::fs::rename(&temp, &path);
+        }
     }
 
     /// Keeps a log line for `glft log` and windows: in memory, and on disk so the log
@@ -585,6 +611,7 @@ impl Engine {
             incoming,
             offers: offers.len(),
             waiting: offers.values().map(|o| o.info.clone()).collect(),
+            arrivals: self.arrivals.lock().unwrap().iter().cloned().collect(),
         }
     }
 

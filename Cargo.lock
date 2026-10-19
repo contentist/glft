@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "glft-cli"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1364,6 +1364,7 @@ dependencies = [
  "clap",
  "glft-core",
  "glft-engine",
+ "libc",
  "qrcode",
  "serde_json",
  "tempfile",
@@ -1374,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "glft-core"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "bao-tree",
  "blake3",
@@ -1401,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "glft-engine"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "glft-core",
@@ -1418,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "glft-ffi"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "glft-core",
  "iroh",
@@ -1429,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "glft-gtk"
-version = "0.1.1"
+version = "0.1.4"
 dependencies = [
  "async-channel",
  "chrono",

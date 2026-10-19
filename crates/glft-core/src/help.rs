@@ -53,6 +53,8 @@ const ERRORS: &[(&str, &str)] = pages![
     "send-not-started",
     "text-not-supported",
     "receive-time-limit",
+    "peer-disk-full",
+    "peer-cant-save",
 ];
 
 /// The page for `id` (an error id, or another topic), as Markdown.

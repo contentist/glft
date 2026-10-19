@@ -163,7 +163,7 @@ impl fmt::Display for Event {
                 let over = via.map(|v| format!(" over {v}")).unwrap_or_default();
                 write!(
                     f,
-                    "{} verified with {peer}{over} ({}, {:.1} s, {}/s)",
+                    "{} verified with {peer}{over}: {} in {:.1} s, {}/s",
                     all_files(totals.files),
                     human_bytes(totals.bytes),
                     secs,
@@ -181,7 +181,7 @@ impl fmt::Display for Event {
                 let at = if places.is_empty() { dest.clone() } else { places.join(", ") };
                 write!(
                     f,
-                    "{} from {peer} verified; saved as {at} ({}, {:.1} s, {}/s)",
+                    "{} from {peer} verified; saved as {at}: {} in {:.1} s, {}/s",
                     all_files(totals.files),
                     human_bytes(totals.bytes),
                     secs,
@@ -203,6 +203,25 @@ pub struct Placed {
     pub place: String,
     /// The same as a path on this device, if it has one, for "Show in folder".
     pub path: Option<std::path::PathBuf>,
+}
+
+impl Placed {
+    /// The folder it is in: "~/Downloads/glft" for "~/Downloads/glft/screenshot.png".
+    pub fn folder(&self) -> &str {
+        self.place.rsplit_once('/').map(|(f, _)| f).unwrap_or(&self.place)
+    }
+}
+
+/// Where a transfer landed, in one sentence: "screenshot.png is in ~/Downloads/glft",
+/// "Album (23 files) is in ~/Downloads/glft", or "3 files, 12 MB are in ~/Downloads/glft".
+pub fn landed(items: &[Placed], totals: &Totals) -> String {
+    match items {
+        [] => String::new(),
+        [one] if one.is_dir => format!("{} ({}) is in {}", one.name, plural(totals.files, "file"), one.folder()),
+        [one] => format!("{} is in {}", one.name, one.folder()),
+        many if many.iter().all(|i| i.folder() == many[0].folder()) => format!("{totals} are in {}", many[0].folder()),
+        many => format!("{totals}: {}", many.iter().map(|i| i.place.as_str()).collect::<Vec<_>>().join(", ")),
+    }
 }
 
 /// "14:03" today, "Mon 14:03" otherwise.
@@ -255,5 +274,25 @@ mod tests {
     fn bytes() {
         assert_eq!(human_bytes(1_500), "1.5 KB");
         assert_eq!(human_bytes(10_000_000_000), "10 GB");
+    }
+}
+
+#[cfg(test)]
+mod landed_tests {
+    use super::*;
+
+    fn item(place: &str, is_dir: bool) -> Placed {
+        Placed { name: place.rsplit('/').next().unwrap().into(), is_dir, place: place.into(), path: None }
+    }
+
+    #[test]
+    fn where_it_landed_reads_as_a_sentence() {
+        let one = Totals { files: 1, folders: 0, bytes: 3_000_000 };
+        let album = Totals { files: 23, folders: 1, bytes: 232_000_000 };
+        let three = Totals { files: 3, folders: 0, bytes: 12_000_000 };
+        assert_eq!(landed(&[item("~/Downloads/glft/screenshot.png", false)], &one), "screenshot.png is in ~/Downloads/glft");
+        assert_eq!(landed(&[item("~/Downloads/glft/Album (2)", true)], &album), "Album (2) (23 files) is in ~/Downloads/glft");
+        let many = [item("Download/glft/a.jpg", false), item("Download/glft/b.jpg", false), item("Download/glft/c.jpg", false)];
+        assert_eq!(landed(&many, &three), "3 files, 12 MB are in Download/glft");
     }
 }

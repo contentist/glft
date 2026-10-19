@@ -444,3 +444,79 @@ async fn nobody_showing_the_code_is_explained() {
     let err = pairing::join(SecretKey::generate(), &code, vec![], &glft_core::events::discard()).await.err().unwrap();
     assert_eq!(err.kind, ErrorKind::PairingNoAnswer);
 }
+
+/// Storage whose disk is full for the big file: the receiver fails with "disk full".
+struct FullForBigFile {
+    inner: LikeMediaStore,
+}
+
+impl ReceiveStorage for FullForBigFile {
+    fn exists(&self, rel: &str) -> std::io::Result<bool> {
+        self.inner.exists(rel)
+    }
+    fn published(&self, rel: &str) -> std::io::Result<bool> {
+        self.inner.published(rel)
+    }
+    fn make_dir(&self, rel: &str) -> std::io::Result<()> {
+        self.inner.make_dir(rel)
+    }
+    fn create_partial(&self, rel: &str) -> std::io::Result<Partial> {
+        if rel.ends_with("big.bin") {
+            return Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        }
+        self.inner.create_partial(rel)
+    }
+    fn reopen_partial(&self, rel: &str, token: &str) -> std::io::Result<Option<Partial>> {
+        self.inner.reopen_partial(rel, token)
+    }
+    fn finish(&self, partial: Partial, hash: &[u8; 32]) -> std::io::Result<()> {
+        self.inner.finish(partial, hash)
+    }
+    fn discard(&self, partial: Partial) -> std::io::Result<()> {
+        self.inner.discard(partial)
+    }
+    fn discard_abandoned(&self, token: &str) -> std::io::Result<()> {
+        self.inner.discard_abandoned(token)
+    }
+    fn describe(&self, rel: &str) -> String {
+        self.inner.describe(rel)
+    }
+}
+
+/// A receiver whose disk is full says so, and the sender reports it instead of resending
+/// the same bytes again and again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_disk_on_the_receiver_stops_the_sender_with_a_sentence() {
+    let src = tempfile::tempdir().unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let album = make_album(src.path());
+    let rx_key = SecretKey::generate();
+    let (rx_events, rx_log, _) = watched(|_| false);
+    let endpoint = net::bind(rx_key.clone(), Some(0), &rx_events).await.unwrap();
+    let port = endpoint.bound_sockets()[0].port();
+    let storage = FullForBigFile { inner: LikeMediaStore { fs: FsStorage::new(dest.path().to_path_buf()).unwrap(), root: dest.path().to_path_buf() } };
+    let opts = Arc::new(ReceiveOptions {
+        storage: Arc::new(storage),
+        decide: counting_yes(Arc::new(AtomicUsize::new(0))),
+        authorize: Arc::new(|_| true),
+        records: Records::new(state.path()),
+        seen: None,
+        once: false,
+    });
+    let ep = endpoint.clone();
+    let rx = tokio::spawn(async move {
+        let _ = transfer::serve(&ep, opts, &rx_events).await;
+    });
+
+    let (tx_events, _, _) = watched(|_| false);
+    let tx = net::bind_ephemeral(SecretKey::generate()).await.unwrap();
+    let peer = net::peer_addr(rx_key.public(), &[SocketAddr::from((Ipv4Addr::LOCALHOST, port))]);
+    let err = tokio::time::timeout(Duration::from_secs(30), transfer::send(&tx, peer, vec![album], &tx_events))
+        .await
+        .expect("the sender gives up rather than retrying")
+        .unwrap_err();
+    rx.abort();
+    assert_eq!(err.kind, glft_core::ErrorKind::PeerDiskFull, "{err:?}");
+    assert!(rx_log.lock().unwrap().join("\n").contains("The disk is full"));
+}

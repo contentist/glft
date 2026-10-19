@@ -7,7 +7,6 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.Uri
-import android.os.Environment
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -18,6 +17,7 @@ import uniffi.glft_ffi.NodeListener
 import uniffi.glft_ffi.OfferInfo
 import uniffi.glft_ffi.PairedDevice
 import uniffi.glft_ffi.ReceivedInfo
+import uniffi.glft_ffi.ReceivedItem
 import uniffi.glft_ffi.Route
 import uniffi.glft_ffi.StorageChoice
 import uniffi.glft_ffi.errorLine
@@ -91,22 +91,27 @@ class GlftApp : Application() {
         _sendState.value = state
     }
 
-    /** The send chosen on screen, handed to [SendJob] in this process. */
-    class QueuedSend(val device: PairedDevice, val outgoing: Outgoing, val route: Route)
+    /** A send the person chose, run by its own [SendJob] ([jobId]), which holds the read
+     *  permission for its files. Sends go one at a time, in the order chosen. */
+    class QueuedSend(val jobId: Int, val device: PairedDevice, val outgoing: Outgoing, val route: Route)
 
-    private var queuedSend: QueuedSend? = null
+    private val _sends = MutableStateFlow<List<QueuedSend>>(emptyList())
 
-    fun queueSend(device: PairedDevice, outgoing: Outgoing, route: Route) {
-        queuedSend = QueuedSend(device, outgoing, route)
-        _sendState.value = SendState.Running(device.name, outgoing.summary, 0, outgoing.bytes)
+    /** Sends chosen and not finished: the first is sending, the rest wait. */
+    val sends: StateFlow<List<QueuedSend>> = _sends
+
+    fun addSend(send: QueuedSend) {
+        _sends.update { it + send }
     }
 
-    /** The send the job is to run. It stays until the send ends, so a job Android stops
-     *  and runs again (after a network change) continues with the same files. */
-    fun queuedSend(): QueuedSend? = queuedSend
+    /** The send for job [jobId]. It stays until the send ends, so a job Android stops and
+     *  runs again (after a network change) continues with the same files. */
+    fun send(jobId: Int): QueuedSend? = _sends.value.find { it.jobId == jobId }
 
-    fun clearQueuedSend() {
-        queuedSend = null
+    fun isNext(jobId: Int): Boolean = _sends.value.firstOrNull()?.jobId == jobId
+
+    fun removeSend(jobId: Int) {
+        _sends.update { list -> list.filterNot { it.jobId == jobId } }
     }
 
     private val _net = MutableStateFlow(NetState())
@@ -211,7 +216,14 @@ class GlftApp : Application() {
         val array = JSONArray(receivedFile.readText())
         (0 until array.length()).map { i ->
             val o = array.getJSONObject(i)
-            ReceivedInfo(o.getLong("at"), o.getString("peer"), o.getString("summary"), o.getInt("files").toUInt(), o.getString("dest"))
+            // Items and the sentence are kept since Day 6; older entries have only the folder.
+            val items = o.optJSONArray("items")?.let { a ->
+                (0 until a.length()).map { j ->
+                    val it = a.getJSONObject(j)
+                    ReceivedItem(it.getString("name"), it.getBoolean("dir"), it.getString("place"))
+                }
+            }.orEmpty()
+            ReceivedInfo(o.getLong("at"), o.getString("peer"), o.getString("summary"), o.getInt("files").toUInt(), o.getString("dest"), items, o.optString("landed", ""))
         }
     } catch (e: Exception) {
         emptyList()
@@ -220,7 +232,12 @@ class GlftApp : Application() {
     private fun saveReceived(list: List<ReceivedInfo>) {
         val array = JSONArray()
         list.forEach {
-            array.put(JSONObject().put("at", it.atUnixMs).put("peer", it.peer).put("summary", it.summary).put("files", it.files.toInt()).put("dest", it.dest))
+            val items = JSONArray()
+            it.items.forEach { i -> items.put(JSONObject().put("name", i.name).put("dir", i.isDir).put("place", i.place)) }
+            array.put(
+                JSONObject().put("at", it.atUnixMs).put("peer", it.peer).put("summary", it.summary).put("files", it.files.toInt())
+                    .put("dest", it.dest).put("items", items).put("landed", it.landed),
+            )
         }
         receivedFile.writeText(array.toString())
     }
@@ -238,12 +255,6 @@ class GlftApp : Application() {
     fun storageChoice(): StorageChoice = when (val s = _saveTo.value) {
         SaveTo.Downloads -> StorageChoice.Foreign(MediaStoreStorage(contentResolver))
         is SaveTo.Picked -> StorageChoice.Foreign(SafStorage(contentResolver, s.tree))
-    }
-
-    /** The plain-path route to Download/glft, kept for the storage benchmark. */
-    fun directPathChoice(): StorageChoice {
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), MediaStoreStorage.FOLDER)
-        return StorageChoice.Path(dir.path, MediaStoreStorage.BASE)
     }
 
     /** Logs an error from the core with its next step and raw detail. */
@@ -309,6 +320,7 @@ class GlftApp : Application() {
             val list = (listOf(received) + _received.value).take(100)
             _received.value = list
             saveReceived(list)
+            Notifications.showReceived(this@GlftApp, received)
             refreshDevices()
         }
     }

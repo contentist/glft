@@ -168,6 +168,19 @@ pub struct Status {
     /// The offers waiting for an answer.
     #[serde(default)]
     pub waiting: Vec<OfferInfo>,
+    /// Recent arrivals, newest first.
+    #[serde(default)]
+    pub arrivals: Vec<Arrival>,
+}
+
+/// A transfer that arrived, and where everything in it is now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Arrival {
+    pub at_unix_ms: i64,
+    pub peer: String,
+    /// "1 folder, 23 files, 232 MB"
+    pub summary: String,
+    pub items: Vec<glft_core::events::Placed>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

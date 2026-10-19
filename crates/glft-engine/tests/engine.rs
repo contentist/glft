@@ -179,7 +179,7 @@ async fn a_send_can_be_cancelled() {
 #[tokio::test]
 async fn two_engines_pair_and_send_with_tagged_progress() {
     let a = Engine::start("Laptop A", 0.0);
-    let b = Engine::start("Laptop B", 0.0);
+    let mut b = Engine::start("Laptop B", 0.0);
     let inbox = b.dir.path().join("inbox");
     b.run(Request::Receive { on: true, dir: Some(inbox.clone()), port: Some(0) }).await;
 
@@ -196,6 +196,21 @@ async fn two_engines_pair_and_send_with_tagged_progress() {
     assert!(tags.iter().all(|t| t.is_some()), "progress without a send id: {tags:?}");
     assert_eq!(std::fs::read(inbox.join("Album/track01.flac")).unwrap().len(), 3 << 20);
     assert!(a.status().await.sending.is_empty());
+
+    // Where it landed: listed on the receiving side with its path, and told to the sender.
+    let place = format!("{}/Album", inbox.display());
+    let arrivals = b.status().await.arrivals;
+    let [arrival] = arrivals.as_slice() else { panic!("expected one arrival, got {arrivals:?}") };
+    assert_eq!(arrival.items[0].place, place);
+    assert_eq!(arrival.items[0].path.as_deref(), Some(inbox.join("Album").as_path()));
+    let sent: Vec<String> = replies.iter().filter_map(|r| if let Reply::Line(l) = r { Some(l.sentence.clone()) } else { None }).collect();
+    assert!(sent.iter().any(|l| l.contains("saved on \"Laptop B\" (") && l.ends_with(&format!(" as {place}"))), "{sent:?}");
+
+    // The list outlives the engine.
+    let dir = std::mem::replace(&mut b.dir, tempfile::tempdir().unwrap());
+    drop(b);
+    let again = Engine::start_in(dir, "Laptop B", 0.0);
+    assert_eq!(again.status().await.arrivals.len(), 1, "arrivals lost when the engine restarted");
 }
 
 #[tokio::test]

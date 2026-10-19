@@ -94,7 +94,6 @@ private fun ShareSheet(uris: List<Uri>, onDone: () -> Unit) {
     }
     when {
         problem != null -> Message(problem!!, onDone)
-        app.sendState.value is SendState.Running -> Message(errorLine("send-already-running", ""), onDone)
         outgoing == null -> Card(Modifier.fillMaxWidth()) {
             Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
         }

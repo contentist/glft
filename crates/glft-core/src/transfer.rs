@@ -128,6 +128,24 @@ pub async fn send_to(endpoint: &Endpoint, peer: EndpointAddr, name: Option<&str>
     deliver(endpoint, peer, name, outgoing, events).await
 }
 
+/// The reason a receiver gave for closing the connection, if it is one to report here: it
+/// closes with the error's id (`receive_one` in `serve`).
+fn peer_gave_up(conn: &Connection, label: &str) -> Option<Error> {
+    let iroh::endpoint::ConnectionError::ApplicationClosed(close) = conn.close_reason()? else { return None };
+    let kind = match &close.reason[..] {
+        b"disk-full" => ErrorKind::PeerDiskFull,
+        b"receive-dir-unwritable" => ErrorKind::PeerCantSave,
+        _ => return None,
+    };
+    Some(Error::new(kind, format!("{label} stopped the transfer: {}", String::from_utf8_lossy(&close.reason))))
+}
+
+/// A device as the log names it: `"Pixel 8 Pro" (1040b4f452)`. The name is what it calls
+/// itself; the short id, the start of its key, is what proves which device it is.
+fn named(name: &str, id: &iroh::EndpointId) -> String {
+    format!("\"{name}\" ({})", short_id(id))
+}
+
 /// Errors after which an accepted transfer is worth trying again.
 fn retryable(kind: ErrorKind) -> bool {
     matches!(kind, ErrorKind::ConnectionLost | ErrorKind::PeerUnreachable | ErrorKind::LocalNetworkBlocked)
@@ -186,7 +204,7 @@ pub async fn deliver(endpoint: &Endpoint, mut peer: EndpointAddr, name: Option<&
     let totals = outgoing.totals();
     let reached = Arc::new(AtomicBool::new(false));
     let mut s = SendState {
-        label: name.map(|n| format!("\"{n}\"")).unwrap_or_else(|| short_id(&peer.id)),
+        label: name.map(|n| named(n, &peer.id)).unwrap_or_else(|| short_id(&peer.id)),
         told_connecting: false,
         saved: Vec::new(),
         accepted: false,
@@ -394,7 +412,7 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
             return Err(Error::new(ErrorKind::Declined, format!("{} declined", s.label)));
         }
         Answer::Accept { device_name, resumed } => {
-            s.label = format!("\"{device_name}\"");
+            s.label = named(&device_name, &conn.remote_id());
             match resumed {
                 Some(Resumed { files_done, bytes_left }) => {
                     events(Event::ResumingSend { peer: s.label.clone(), files_done: files_done as usize, files: totals.files, bytes_left });
@@ -447,7 +465,12 @@ async fn attempt(endpoint: &Endpoint, peer: EndpointAddr, outgoing: &Arc<Outgoin
         .filter(|a| net::lan_rank(a) < 3)
         .or(dialled_lan)
         .or_else(|| paths.into_iter().find(|p| p.is_selected()).and_then(|p| ip(&p)));
+    // The receiver may have ended it for a reason this side should report rather than retry.
+    let gave_up = done.as_ref().err().and_then(|_| peer_gave_up(&conn, &s.label));
     conn.close(0u32.into(), b"done");
+    if let Some(e) = gave_up {
+        return Err(e);
+    }
     let done = done?;
     if done.files as usize != totals.files {
         return Err(Error::new(
@@ -630,7 +653,6 @@ const NOT_PAIRED: &[u8] = b"not-paired";
 /// Accepts connections until the endpoint closes. Each connection is handled on its own,
 /// so one device's transfer does not keep another waiting.
 pub async fn serve(endpoint: &Endpoint, opts: Arc<ReceiveOptions>, events: &EventSink) -> Result<(), Error> {
-    events(Event::ReceiveFolder { dir: opts.storage.describe("") });
     let (records, storage) = (opts.records.clone(), opts.storage.clone());
     let _ = blocking(move || {
         discard_expired(&records, storage.as_ref());
@@ -697,10 +719,24 @@ fn discard_expired(records: &Records, storage: &dyn ReceiveStorage) {
 
 async fn receive_one(conn: &Connection, opts: &ReceiveOptions, events: &EventSink, active: &Active) -> Result<(), Error> {
     let sender = conn.remote_id();
-    let short = short_id(&sender);
-    events(Event::Connected { peer: short.clone() });
-    let (mut ctl_send, mut ctl_recv) = conn.accept_bi().await.map_err(lost)?;
-    let offer: Offer = proto::read(&mut ctl_recv).await?;
+    // A sender that gives up on a connection before offering anything (it heard of a better
+    // address and dialled that instead) has lost nothing: no error to show for it.
+    let (mut ctl_send, mut ctl_recv) = match conn.accept_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            tracing::debug!(sender = %short_id(&sender), error = %e, "connection ended before an offer");
+            return Ok(());
+        }
+    };
+    let offer: Offer = match proto::read(&mut ctl_recv).await {
+        Ok(offer) => offer,
+        Err(e) if e.kind == ErrorKind::ConnectionLost => {
+            tracing::debug!(sender = %short_id(&sender), detail = %e.detail, "connection ended before an offer");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    events(Event::Connected { peer: named(&offer.device_name, &sender) });
     let manifest = offer.manifest;
     if let Err(e) = manifest.validate() {
         let _ = proto::write(&mut ctl_send, &Answer::Decline).await;
@@ -748,7 +784,7 @@ async fn receive_offer(
     held: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), Error> {
     let sender = conn.remote_id();
-    let label = format!("\"{device_name_offered}\"");
+    let label = named(&device_name_offered, &sender);
     let totals = manifest.totals();
     let dest = opts.storage.describe("");
 

@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Bundle
@@ -57,8 +56,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import uniffi.glft_ffi.GlftException
-import uniffi.glft_ffi.StorageChoice
 import uniffi.glft_ffi.coreVersion
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -209,10 +206,9 @@ private fun Screen() {
 
         item {
             Section("Send") {
-                val running = sendState is SendState.Running
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(enabled = !running, onClick = { whenNetworkAllowed { pickFiles.launch(arrayOf("*/*")) } }) { Text("Send files") }
-                    OutlinedButton(enabled = !running, onClick = { whenNetworkAllowed { pickFolder.launch(null) } }) { Text("Send a folder") }
+                    Button(onClick = { whenNetworkAllowed { pickFiles.launch(arrayOf("*/*")) } }) { Text("Send files") }
+                    OutlinedButton(onClick = { whenNetworkAllowed { pickFolder.launch(null) } }) { Text("Send a folder") }
                 }
                 Text("Or share from any app and choose glft.", style = MaterialTheme.typography.bodySmall)
                 if (forSending && (explaining || refused || !access.network)) {
@@ -234,6 +230,18 @@ private fun Screen() {
                     )
                 }
                 SendStatus(sendState)
+                // Sends chosen while one runs: they go next, in order.
+                val sends by app.sends.collectAsStateWithLifecycle()
+                sends.drop(1).forEach { waiting ->
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "Waiting: ${waiting.outgoing.summary} to ${waiting.device.name}",
+                            Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        TextButton(onClick = { Sends.cancelWaiting(context, waiting.jobId) }) { Text("Cancel") }
+                    }
+                }
             }
         }
 
@@ -352,45 +360,27 @@ private fun Screen() {
             }
         }
 
-        if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-            item {
-                Section("Storage test (debug builds)") {
-                    Text("Writes 1,000 files of 64 KB the way a transfer does, then reports the time.", style = MaterialTheme.typography.bodySmall)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        val run = { name: String, choice: () -> StorageChoice ->
-                            scope.launch {
-                                app.note("Storage test ($name) started")
-                                val result = withContext(Dispatchers.IO) {
-                                    try {
-                                        app.node.benchmarkStorage(choice(), 1000u, 65536u)
-                                    } catch (e: GlftException.Failed) {
-                                        "failed: ${e.headline} [${e.detail}]"
-                                    }
-                                }
-                                app.note("Storage test ($name): $result")
-                            }
-                            Unit
-                        }
-                        OutlinedButton(onClick = { run("media store") { StorageChoice.Foreign(MediaStoreStorage(context.contentResolver)) } }) { Text("Media store") }
-                        OutlinedButton(onClick = { run("direct path") { app.directPathChoice() } }) { Text("Direct") }
-                        OutlinedButton(
-                            enabled = saveTo is SaveTo.Picked,
-                            onClick = { run("picked folder") { app.storageChoice() } },
-                        ) { Text("Picked") }
-                    }
-                }
-            }
-        }
-
         if (received.isNotEmpty()) {
             item { Text("Received", style = MaterialTheme.typography.titleMedium) }
             items(received.take(10), key = { "received-${it.atUnixMs}" }) { r ->
+                val context = LocalContext.current
                 Column {
                     Text(if (r.files == 1u) "✓ Verified · ${r.summary}" else "✓ All ${r.files} files verified · ${r.summary}", style = MaterialTheme.typography.bodyMedium)
+                    // Where it is, in full: nobody should have to know where glft saves things.
+                    Text(r.landed.ifEmpty { "In ${r.dest}" }, style = MaterialTheme.typography.bodyMedium)
                     Text(
-                        "From ${r.peer} · ${r.dest} · ${SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(r.atUnixMs))}",
+                        "From ${r.peer} · ${SimpleDateFormat("d MMM HH:mm", Locale.getDefault()).format(Date(r.atUnixMs))}",
                         style = MaterialTheme.typography.bodySmall,
                     )
+                    r.items.firstOrNull()?.let { first ->
+                        Row {
+                            r.items.singleOrNull()?.let { one ->
+                                TextButton(onClick = { Places.start(context, Places.openIntent(context, one), one.place) }) { Text("Open") }
+                            }
+                            val folder = if (first.isDir) first.place else Places.folderOf(first)
+                            TextButton(onClick = { Places.start(context, Places.folderIntent(folder), folder) }) { Text("Show folder") }
+                        }
+                    }
                 }
             }
         }
@@ -453,7 +443,7 @@ private fun SendStatus(state: SendState) {
             }
         }
         is SendState.Done -> Text(
-            "✓ Sent to ${state.peer}${state.via?.let { " over $it" } ?: ""}: ${state.summary}, ${if (state.files == 1) "verified" else "all ${state.files} files verified"}",
+            "✓ Sent to ${state.peer}${state.via?.let { " over $it" } ?: ""}: ${doneText(state)}",
             style = MaterialTheme.typography.bodyMedium,
         )
         is SendState.Failed -> {

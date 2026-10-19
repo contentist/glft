@@ -120,6 +120,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `glft log | head`: end quietly when the reader goes away, as other tools do.
+    // SAFETY: setting a signal's disposition to the default is always sound.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match run(cli.command).await {
         Ok(code) => code,

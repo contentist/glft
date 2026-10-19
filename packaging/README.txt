@@ -36,7 +36,9 @@ With the .deb (Mint, Ubuntu, Debian)
     sudo apt install ./glft_VERSION_amd64.deb
     sudo apt remove glft
 
-The package stops any running engine before it replaces or removes its files.
+The package stops any running engine before it replaces or removes its files. So after
+an upgrade receiving is off, as it is after every start: switch it on again in the
+window, or with `glft receive on`. Unfinished transfers continue once it's on.
 
 Getting started
 ---------------

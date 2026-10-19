@@ -3,7 +3,12 @@
 //! Without a notification server (no desktop session), the engine carries on and the
 //! terminal commands do the same jobs.
 
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use glft_core::events::{Placed, Totals};
 
 use notify_rust::{Hint, Notification, NotificationResponse, Timeout};
 use tokio::sync::oneshot;
@@ -118,19 +123,74 @@ pub fn offer(engine: Arc<Engine>, offer: OfferInfo) -> Option<Notice> {
     }))
 }
 
-/// "Received from Pixel 8 Pro": shown once when a transfer arrives complete, so files
-/// accepted without asking don't arrive unnoticed.
-pub fn received(peer: &str, summary: &str, dest: &str) {
+/// "Received from Pixel 8 Pro: screenshot.png is in ~/Downloads/glft", with Show in folder
+/// and Open: shown when a transfer arrives complete, so nobody has to know where glft
+/// saves things, and files accepted without asking don't arrive unnoticed.
+pub fn received(peer: &str, totals: &Totals, items: &[Placed]) {
+    let landed = glft_core::events::landed(items, totals);
     let mut n = Notification::new();
     n.appname("glft")
         .summary(&format!("Received from {peer}"))
-        .body(&format!("{summary}, every file verified, in {dest}"))
+        .body(&format!("{landed}. Every file verified."))
         .icon("document-save")
-        .timeout(Timeout::Default);
+        .timeout(Timeout::Never);
+    let paths: Vec<PathBuf> = items.iter().filter_map(|i| i.path.clone()).collect();
+    if !paths.is_empty() {
+        n.action("show", "Show in folder");
+        // One file or folder opens in its usual app; several are best seen in the folder.
+        if paths.len() == 1 {
+            n.action("open", "Open");
+        }
+    }
     if disabled() {
         return;
     }
     tokio::spawn(async move {
-        let _ = n.show_async().await;
+        let Ok(handle) = n.show_async().await else { return };
+        handle
+            .wait_for_action_async(move |r: &NotificationResponse| match r {
+                NotificationResponse::Action(a) if a == "show" => show_in_folder(&paths),
+                NotificationResponse::Action(a) if a == "open" => open(&paths[0]),
+                // Clicking the notification itself: the most useful of the two.
+                NotificationResponse::Default if paths.len() == 1 => open(&paths[0]),
+                NotificationResponse::Default if !paths.is_empty() => show_in_folder(&paths),
+                _ => {}
+            })
+            .await;
     });
+}
+
+/// Opens the file manager with `paths` selected (the FileManager1 interface Nemo, Nautilus,
+/// Dolphin and others offer), or else just the folder of the first.
+pub fn show_in_folder(paths: &[PathBuf]) {
+    let uris: Vec<String> = paths.iter().map(|p| file_uri(p)).collect();
+    let list = format!("[{}]", uris.iter().map(|u| format!("'{u}'")).collect::<Vec<_>>().join(", "));
+    let shown = std::process::Command::new("gdbus")
+        .args(["call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path", "/org/freedesktop/FileManager1"])
+        .args(["--method", "org.freedesktop.FileManager1.ShowItems", &list, ""])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !shown && let Some(folder) = paths.first().and_then(|p| p.parent()) {
+        open(folder);
+    }
+}
+
+/// Opens a file in its usual app, or a folder in the file manager.
+pub fn open(path: &Path) {
+    let _ = std::process::Command::new("xdg-open").arg(path).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+}
+
+/// `file:///home/me/Downloads/glft/my%20photo.jpg`
+fn file_uri(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut uri = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => uri.push(b as char),
+            _ => uri.push_str(&format!("%{b:02X}")),
+        }
+    }
+    uri
 }

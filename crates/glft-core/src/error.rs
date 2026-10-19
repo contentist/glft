@@ -56,6 +56,10 @@ pub enum ErrorKind {
     TextNotSupported,
     /// Android's daily limit on background receiving was reached.
     ReceiveTimeLimit,
+    /// The receiving device's disk filled up, as it told this one.
+    PeerDiskFull,
+    /// The receiving device can't write its receive folder, as it told this one.
+    PeerCantSave,
 }
 
 /// Where an error is shown, which decides how its next step is worded: the terminal can
@@ -122,6 +126,8 @@ impl ErrorKind {
         Self::SendNotStarted,
         Self::TextNotSupported,
         Self::ReceiveTimeLimit,
+        Self::PeerDiskFull,
+        Self::PeerCantSave,
     ];
 
     /// Its place in [`Self::ALL`]. The match is exhaustive, so a new kind can't be
@@ -169,6 +175,8 @@ impl ErrorKind {
             Self::SendNotStarted => 38,
             Self::TextNotSupported => 39,
             Self::ReceiveTimeLimit => 40,
+            Self::PeerDiskFull => 41,
+            Self::PeerCantSave => 42,
         }
     }
 
@@ -221,6 +229,8 @@ impl ErrorKind {
             Self::SendNotStarted => "send-not-started",
             Self::TextNotSupported => "text-not-supported",
             Self::ReceiveTimeLimit => "receive-time-limit",
+            Self::PeerDiskFull => "peer-disk-full",
+            Self::PeerCantSave => "peer-cant-save",
         }
     }
 
@@ -268,6 +278,8 @@ impl ErrorKind {
             Self::SendNotStarted => "The send didn't start.",
             Self::TextNotSupported => "glft sends files; sharing text or links isn't possible yet.",
             Self::ReceiveTimeLimit => "Receiving stopped: Android allows background receiving for 6 hours a day.",
+            Self::PeerDiskFull => "The other device's disk is full, so the rest can't be saved there.",
+            Self::PeerCantSave => "The other device can't write to its receive folder.",
         }
     }
 
@@ -347,6 +359,8 @@ impl ErrorKind {
             (Self::SendNotStarted, _) => "Send the files again.",
             (Self::TextNotSupported, _) => "Share a file instead, or save the text to a file first.",
             (Self::ReceiveTimeLimit, _) => "Open glft and switch receiving on again.",
+            (Self::PeerDiskFull, _) => "Free some space on the other device, then send again; what arrived there is kept, and the transfer continues from there.",
+            (Self::PeerCantSave, _) => "On the other device, check its receive folder (glft's log there says which and why), then send again.",
         }
     }
 }

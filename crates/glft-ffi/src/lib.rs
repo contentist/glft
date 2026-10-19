@@ -237,6 +237,16 @@ pub struct SendResult {
     /// The mesh ("Yggdrasil") if that is what carried the data at the end; `None` for the
     /// local network.
     pub via: Option<String>,
+    /// Where the receiver saved each item ("~/Downloads/glft/Album"); empty if it didn't say.
+    pub saved: Vec<String>,
+}
+
+/// One item of an arrival and where it is: "Download/glft/screenshot.png".
+#[derive(uniffi::Record, Clone)]
+pub struct ReceivedItem {
+    pub name: String,
+    pub is_dir: bool,
+    pub place: String,
 }
 
 /// A finished incoming transfer, for the Received list.
@@ -247,6 +257,9 @@ pub struct ReceivedInfo {
     pub summary: String,
     pub files: u32,
     pub dest: String,
+    pub items: Vec<ReceivedItem>,
+    /// "screenshot.png is in Download/glft", for the notification.
+    pub landed: String,
 }
 
 /// "Remember this device?"
@@ -485,6 +498,7 @@ impl Node {
         let seen: Seen = Arc::new(move |id, name| {
             let _ = devices.lock().unwrap().seen(id, Some(name), &[]);
         });
+        events(Event::ReceiveFolder { dir: storage.describe("") });
         let opts = Arc::new(ReceiveOptions {
             storage,
             decide: self.decider(listener.clone()),
@@ -647,7 +661,7 @@ impl Node {
         match result {
             Ok(delivered) => {
                 let _ = self.devices.lock().unwrap().seen(&id, None, delivered.addr.as_slice());
-                Ok(SendResult { peer: device.name, summary: delivered.totals.to_string(), files: delivered.totals.files as u32, secs: delivered.secs, via: delivered.via.map(String::from) })
+                Ok(SendResult { peer: device.name, summary: delivered.totals.to_string(), files: delivered.totals.files as u32, secs: delivered.secs, via: delivered.via.map(String::from), saved: delivered.saved })
             }
             Err(e) => Err(explain_network(e).into()),
         }
@@ -778,13 +792,15 @@ fn sink(listener: Arc<dyn NodeListener>) -> EventSink {
             listener.on_send_progress(done, total);
             return;
         }
-        if let Event::Received { peer, totals, dest, .. } = &event {
+        if let Event::Received { peer, totals, dest, items, .. } = &event {
             listener.on_received(ReceivedInfo {
                 at_unix_ms,
                 peer: peer.clone(),
                 summary: totals.to_string(),
                 files: totals.files as u32,
                 dest: dest.clone(),
+                items: items.iter().map(|i| ReceivedItem { name: i.name.clone(), is_dir: i.is_dir, place: i.place.clone() }).collect(),
+                landed: glft_core::events::landed(items, totals),
             });
         }
         // The bar for a transfer that stopped arriving; it comes back when it resumes.

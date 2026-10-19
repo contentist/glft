@@ -25,6 +25,7 @@ const APP_ID: &str = "io.github.contentist.glft";
 /// Log lines kept for "Copy all"; the window shows the last few.
 const LOG_KEEP: usize = 500;
 const LOG_SHOWN: usize = 8;
+const RECEIVED_SHOWN: usize = 5;
 
 const CSS: &str = "
 .drop { border: 2px dashed alpha(currentColor, 0.35); border-radius: 8px; padding: 18px; }
@@ -111,6 +112,9 @@ pub struct Ui {
     pending: RefCell<Vec<PathBuf>>,
 
     transfers_section: gtk::Box,
+
+    received_section: gtk::Box,
+    received: gtk::ListBox,
     transfers: gtk::ListBox,
     bars: RefCell<HashMap<Key, gtk::ProgressBar>>,
 
@@ -270,6 +274,14 @@ impl Ui {
         transfers_section.set_visible(false);
         content.append(&transfers_section);
 
+        // Received: where every arrival is, one click away.
+        let received_section = vbox(6);
+        received_section.append(&heading("Received"));
+        let received = list();
+        received_section.append(&received);
+        received_section.set_visible(false);
+        content.append(&received_section);
+
         // Paired devices.
         let devices_head = hbox(8);
         let devices_title = heading("Paired devices");
@@ -318,6 +330,8 @@ impl Ui {
             confirm_devices,
             pending: RefCell::default(),
             transfers_section,
+            received_section,
+            received,
             transfers,
             bars: RefCell::default(),
             devices_list,
@@ -549,6 +563,49 @@ impl Ui {
         }
         *self.bars.borrow_mut() = bars;
         self.transfers_section.set_visible(!s.sending.is_empty() || !s.incoming.is_empty());
+
+        // Received.
+        self.received.remove_all();
+        for a in s.arrivals.iter().take(RECEIVED_SHOWN) {
+            let line = hbox(8);
+            let text = vbox(2);
+            let what = match a.items.as_slice() {
+                [one] => one.name.clone(),
+                _ => a.summary.clone(),
+            };
+            text.append(&label(&what));
+            let when = chrono::DateTime::from_timestamp_millis(a.at_unix_ms)
+                .map(|t| t.with_timezone(&chrono::Local).format("%d %b %H:%M").to_string())
+                .unwrap_or_default();
+            let places: Vec<&str> = a.items.iter().map(|i| i.place.as_str()).collect();
+            let place = dim(&places.join(", "));
+            place.set_selectable(true);
+            text.append(&place);
+            text.append(&dim(&format!("From {}, {when}, {}", a.peer, a.summary)));
+            text.set_hexpand(true);
+            line.append(&text);
+            let paths: Vec<PathBuf> = a.items.iter().filter_map(|i| i.path.clone()).collect();
+            if let Some(first) = paths.first() {
+                let show = gtk::Button::with_label("Show in folder");
+                show.set_valign(gtk::Align::Center);
+                let (window, file) = (self.window.clone(), gio::File::for_path(first));
+                show.connect_clicked(move |_| {
+                    gtk::FileLauncher::new(Some(&file)).open_containing_folder(Some(&window), gio::Cancellable::NONE, |_| {});
+                });
+                line.append(&show);
+                if paths.len() == 1 {
+                    let open = gtk::Button::with_label("Open");
+                    open.set_valign(gtk::Align::Center);
+                    let (window, file) = (self.window.clone(), gio::File::for_path(first));
+                    open.connect_clicked(move |_| {
+                        gtk::FileLauncher::new(Some(&file)).launch(Some(&window), gio::Cancellable::NONE, |_| {});
+                    });
+                    line.append(&open);
+                }
+            }
+            self.received.append(&row(&line));
+        }
+        self.received_section.set_visible(!s.arrivals.is_empty());
     }
 
     fn transfer_row(self: &Rc<Self>, what: &str, done: u64, total: u64, send: Option<u64>) -> gtk::ProgressBar {

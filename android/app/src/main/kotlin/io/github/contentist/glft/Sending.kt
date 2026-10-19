@@ -52,8 +52,16 @@ sealed interface SendState {
     data object Idle : SendState
     data class Running(val peer: String, val summary: String, val done: Long = 0, val total: Long = 0) : SendState
     /** [via] names the mesh (Yggdrasil) if that carried the data; null for Wi-Fi. */
-    data class Done(val peer: String, val summary: String, val files: Int, val secs: Double, val via: String? = null) : SendState
+    /** [saved]: where the receiver says it put each item, if it said. */
+    data class Done(val peer: String, val summary: String, val files: Int, val secs: Double, val via: String? = null, val saved: List<String> = emptyList()) : SendState
     data class Failed(val peer: String, val summary: String, val headline: String, val nextStep: String, val detail: String) : SendState
+}
+
+/** "1 file, 3 MB · verified · saved on Inspiron as ~/Downloads/glft/a.jpg" */
+fun doneText(s: SendState.Done): String {
+    val verified = if (s.files == 1) "verified" else "all ${s.files} files verified"
+    val saved = if (s.saved.isEmpty()) "" else " · saved on ${s.peer} as ${s.saved.joinToString(", ")}"
+    return "${s.summary} · $verified$saved"
 }
 
 /** Opens the chosen files for the core, once per request it makes. */
@@ -133,20 +141,21 @@ fun ContentResolver.outgoingFolder(tree: Uri): Outgoing {
 }
 
 object Sends {
-    private const val JOB_ID = 1
+    /** Job ids for sends; each send has its own job (see [GlftApp.QueuedSend]). */
+    private val nextJobId = java.util.concurrent.atomic.AtomicInteger((System.currentTimeMillis() % 100_000).toInt() + 1000)
 
     /**
-     * Starts sending [outgoing] to [device] as a user-initiated transfer job. It must be
-     * called while glft is on screen, which is when the person chose to send.
+     * Sends [outgoing] to [device] as a user-initiated transfer job, after any sends chosen
+     * before it. It must be called while glft is on screen, which is when the person chose
+     * to send.
      */
     fun start(context: Context, device: PairedDevice, outgoing: Outgoing, route: Route): Boolean {
         val app = context.glft
-        if (app.sendState.value is SendState.Running) {
-            app.fail("send-already-running")
-            return false
-        }
-        app.queueSend(device, outgoing, route)
-        val builder = JobInfo.Builder(JOB_ID, ComponentName(context, SendJob::class.java))
+        val jobId = nextJobId.getAndIncrement()
+        val ahead = app.sends.value.size
+        app.addSend(GlftApp.QueuedSend(jobId, device, outgoing, route))
+        if (ahead == 0) app.setSendState(SendState.Running(device.name, outgoing.summary, 0, outgoing.bytes))
+        val builder = JobInfo.Builder(jobId, ComponentName(context, SendJob::class.java))
         if (outgoing.grants.isNotEmpty()) {
             // The job holds the read grants for as long as it runs, after the share sheet
             // or picker that received them has closed.
@@ -162,13 +171,25 @@ object Sends {
             .setEstimatedNetworkBytes(0, outgoing.bytes)
             .build()
         val scheduled = context.getSystemService(JobScheduler::class.java).schedule(job) == JobScheduler.RESULT_SUCCESS
-        if (scheduled) {
-            val how = if (route == Route.MESH) " over ${device.mesh ?: "the mesh"}" else ""
-            Toast.makeText(context, "Sending to ${device.name}$how…", Toast.LENGTH_SHORT).show()
-        } else {
+        if (!scheduled) {
+            app.removeSend(jobId)
             app.fail("send-not-started", "JobScheduler refused the job")
+            return false
         }
-        return scheduled
+        val how = if (route == Route.MESH) " over ${device.mesh ?: "the mesh"}" else ""
+        val message = if (ahead == 0) "Sending to ${device.name}$how…" else "Waiting: ${outgoing.summary} goes to ${device.name} after the current send"
+        if (ahead > 0) app.note(message)
+        Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
+        return true
+    }
+
+    /** Takes a send that hasn't started yet off the list. */
+    fun cancelWaiting(context: Context, jobId: Int) {
+        val app = context.glft
+        val send = app.send(jobId) ?: return
+        app.removeSend(jobId)
+        context.getSystemService(JobScheduler::class.java).cancel(jobId)
+        app.note("Cancelled before it started: ${send.outgoing.summary} to ${send.device.name}")
     }
 }
 

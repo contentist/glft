@@ -84,6 +84,19 @@ mod tests {
     }
 
     #[test]
+    fn the_index_lists_every_topic_and_nothing_else() {
+        // docs/help/README.md, the index on GitHub and the project site.
+        let index = include_str!("../../../docs/help/README.md");
+        for (id, _) in super::topics() {
+            assert!(index.contains(&format!("({id}.md)")), "the index doesn't list {id}");
+        }
+        for link in index.split("](").skip(1) {
+            let id = link.split(".md)").next().unwrap_or_default();
+            assert!(super::page(id).is_some(), "the index links to a missing page {id}");
+        }
+    }
+
+    #[test]
     fn pages_name_only_topics_that_exist() {
         // "see **vpn-lockdown**" must lead somewhere.
         for (id, page) in super::ERRORS.iter().chain(super::EXTRA) {

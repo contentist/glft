@@ -121,7 +121,7 @@ fun PairScreen(onClose: () -> Unit) {
         Text("Pair with a computer", style = MaterialTheme.typography.headlineSmall)
         when (val s = step) {
             Step.ExplainCamera -> {
-                Text("On the computer, run `glft pair`. It shows a QR code.")
+                Text("On the computer, open glft and click \"Pair a phone…\" (or run `glft pair` in a terminal). It shows a QR code.")
                 Text(
                     "glft needs the camera to read it. The camera is used only while this screen is open, " +
                         "and only to read the code.",
@@ -137,7 +137,7 @@ fun PairScreen(onClose: () -> Unit) {
                 Button(onClick = { step = Step.Paste }) { Text("Paste the code") }
             }
             Step.Scan -> {
-                Text("Point the camera at the QR code that `glft pair` shows on the computer.")
+                Text("Point the camera at the QR code on the computer.")
                 QrScanner(Modifier.fillMaxWidth().aspectRatio(1f)) { code -> connect(code) }
                 TextButton(onClick = { step = Step.Paste }) { Text("Paste the code instead") }
             }

@@ -1,0 +1,16 @@
+# The project site, built by GitHub Pages from this branch: README.md is the front page,
+# docs/help/ the help pages and docs/decisions/ the design records. The rest is left out.
+title: glft
+description: Send files directly between your phone and your Linux computer, verified.
+theme: jekyll-theme-primer
+exclude:
+  - android
+  - crates
+  - contrib
+  - packaging
+  - fastlane
+  - target
+  - dist
+  - Cargo.toml
+  - Cargo.lock
+  - rust-toolchain.toml

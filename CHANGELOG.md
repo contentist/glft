@@ -5,7 +5,7 @@
 The first public release.
 
 glft sends files and whole folders directly between an Android phone (GrapheneOS or any
-Android 14 or newer) and a Linux computer, over your local network or a mesh such as
+Android 14 or newer) and a Linux computer, over the user's own network or a mesh such as
 Yggdrasil, with no server in between.
 
 - **Verified:** every file is checked with BLAKE3 as it arrives.

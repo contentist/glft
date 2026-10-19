@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "glft-cli"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1375,7 +1375,7 @@ dependencies = [
 
 [[package]]
 name = "glft-core"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "bao-tree",
  "blake3",
@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "glft-engine"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "glft-core",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "glft-ffi"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "glft-core",
  "iroh",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "glft-gtk"
-version = "0.1.5"
+version = "0.2.0"
 dependencies = [
  "async-channel",
  "chrono",

@@ -57,12 +57,22 @@ val cargoNdk = tasks.register<CargoNdk>("cargoNdk") {
     // Cargo decides what is stale; Gradle always asks it.
     outputs.upToDateWhen { false }
     doFirst {
+        // Emptied first, so libraries left by earlier builds never end up in the app.
+        outDir.get().asFile.deleteRecursively()
         environment("ANDROID_NDK_HOME", ndkDir.get().asFile.path)
+        // No path of the build machine in the library, so two builds of a commit match.
+        val cargoHome = System.getenv("CARGO_HOME") ?: "${System.getProperty("user.home")}/.cargo"
+        environment("RUSTFLAGS", "--remap-path-prefix=${repoRoot.path}=/glft --remap-path-prefix=$cargoHome=/cargo")
         commandLine(
             "cargo", "ndk", "-t", "arm64-v8a", "--platform", "34",
             "-o", outDir.get().asFile.path,
             "build", "-p", "glft-ffi", "--release", "--locked",
         )
+    }
+    // cargo-ndk copies every shared library the build made, including iroh's own, which
+    // the app never loads.
+    doLast {
+        outDir.get().asFile.walk().filter { it.isFile && it.name != "libglft_ffi.so" }.forEach { it.delete() }
     }
 }
 

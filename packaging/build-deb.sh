@@ -3,9 +3,8 @@
 # user units, the menu entry, icon and Nemo action, and scripts that stop a running
 # engine before files change.
 set -eu
-cd "$(dirname "$0")/.."
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-cargo build --release --locked -p glft-cli -p glft-engine -p glft-gtk
+. "$(dirname "$0")/common.sh"
+cargo build --release --locked --target-dir "$target" -p glft-cli -p glft-engine -p glft-gtk
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
@@ -14,7 +13,7 @@ install -d "$root/DEBIAN" "$root/usr/bin" "$root/usr/lib/systemd/user" \
     "$root/usr/share/applications" "$root/usr/share/icons/hicolor/scalable/apps" \
     "$root/usr/share/nemo/actions" "$root/usr/share/doc/glft"
 for p in glft glftd glft-window; do
-    install -m 755 -s "target/release/$p" "$root/usr/bin/$p"
+    install -m 755 -s "$target/release/$p" "$root/usr/bin/$p"
 done
 cat > "$root/usr/lib/systemd/user/glft.socket" <<'UNIT'
 [Unit]
@@ -47,13 +46,12 @@ install -m 755 packaging/deb/prerm packaging/deb/postinst packaging/deb/postrm "
 # Library versions the programs need, from their own symbols.
 mkdir -p "$stage/debian" && echo "Source: glft" > "$stage/debian/control"
 depends=$(cd "$stage" && dpkg-shlibdeps -O "glft_${version}_amd64/usr/bin/glftd" "glft_${version}_amd64/usr/bin/glft" "glft_${version}_amd64/usr/bin/glft-window" 2>/dev/null | sed -n 's/^shlibs:Depends=//p')
-maintainer="$(git config user.name) <$(git config user.email)>"
 size=$(du -sk "$root/usr" | cut -f1)
 cat > "$root/DEBIAN/control" <<CONTROL
 Package: glft
 Version: $version
 Architecture: amd64
-Maintainer: $maintainer
+Maintainer: Mister Human <319569693+contentist@users.noreply.github.com>
 Installed-Size: $size
 Depends: $depends
 Suggests: nemo
@@ -67,6 +65,7 @@ Description: send files directly between your phone and computer, verified
  step is shown in plain words. Includes the terminal program (glft), the
  background engine (glftd), the window (glft-window) and a Nemo action.
 CONTROL
+find "$root" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 mkdir -p dist
 dpkg-deb --root-owner-group --build "$root" "dist/glft_${version}_amd64.deb" >/dev/null
 echo "dist/glft_${version}_amd64.deb"

@@ -27,14 +27,26 @@ in the background.
 
 ## Installing
 
-Everything the user needs is on the
-[Releases page](https://github.com/contentist/glft/releases/latest).
+The user needs two files from the
+[Releases page](https://github.com/contentist/glft/releases/latest): one for the phone and
+one for the computer.  They're listed under **Assets** at the bottom of the release.  The
+other files aren't needed.
+
+The computer needs 64-bit Linux (x86-64) with GTK 4.12 and glibc 2.39 or newer.  That covers
+Linux Mint 22, Ubuntu 24.04, Debian 13 and Fedora 40 or later.  Debian 12 is too old.
 
 ### Phone
 
-Download `glft-<version>.apk` and open it to install it.  If the user would like updates to arrive
-on their own, add `https://github.com/contentist/glft` to
-[Obtainium](https://obtainium.imranr.dev/) instead.
+1. On the phone, open the
+   [Releases page](https://github.com/contentist/glft/releases/latest) in the browser.
+2. Under **Assets**, tap **`glft-0.2.0.apk`** to download it.
+3. Open the downloaded file, from the browser's download message or from the Files app.
+4. If Android asks whether the browser may install apps, allow it, then go back.
+5. Tap **Install**, then **Open**.
+
+If the user would like updates to arrive on their own, add
+`https://github.com/contentist/glft` to [Obtainium](https://obtainium.imranr.dev/) instead
+of steps 1 to 5.
 
 Every glft APK is signed with the same certificate.  If the user wants to check it, its SHA-256
 fingerprint is:
@@ -43,29 +55,37 @@ fingerprint is:
 83:89:1A:64:68:02:0F:41:98:9F:D1:92:77:0B:F2:9F:7C:40:D1:BA:1A:AF:08:FC:0D:C1:DC:9F:53:76:07:94
 ```
 
-### Computer
+### Computer (Linux Mint, Ubuntu, Debian)
 
-The user will need 64-bit Linux (x86-64) with GTK 4.12 and glibc 2.39 or newer.  That covers
-Linux Mint 22, Ubuntu 24.04, Debian 13 and Fedora 40 or later.  Debian 12 is too old.
+1. On the computer, open the
+   [Releases page](https://github.com/contentist/glft/releases/latest).
+2. Under **Assets**, click **`glft_0.2.0_amd64.deb`**.  It goes into the Downloads folder.
+3. Open the Downloads folder and double-click the file.  The package installer opens.
+   Click **Install** and enter the computer's password.
+4. glft is now in the menu.
 
-On Mint, Ubuntu or Debian, download `glft_<version>_amd64.deb` and install it with this
-command:
+In a terminal, this command does the same as steps 3 and 4:
 
 ```
-sudo apt install ./glft_<version>_amd64.deb
+sudo apt install ~/Downloads/glft_0.2.0_amd64.deb
 ```
 
-On other distributions, download `glft-<version>-x86_64-linux.tar.gz`, unpack it and run
+### Computer (other Linux distributions)
+
+Download **`glft-0.2.0-x86_64-linux.tar.gz`** instead of the `.deb`, then unpack it and run
 its setup:
 
 ```
-tar xf glft-<version>-x86_64-linux.tar.gz
-cd glft-<version>-x86_64-linux
+cd ~/Downloads
+tar xf glft-0.2.0-x86_64-linux.tar.gz
+cd glft-0.2.0-x86_64-linux
 ./glft setup
 ```
 
 This installs glft into the user's home folder (`~/.local`), so it doesn't need root.  To remove
 it later, run `glft uninstall`.
+
+### Checking the downloads (optional)
 
 If the user wants to check the downloads, put `SHA256SUMS` in the same folder as them and run
 `sha256sum -c SHA256SUMS`.

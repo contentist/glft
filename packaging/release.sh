@@ -31,6 +31,12 @@ authors=$(git log --format='%ae%n%ce' "$tag" | sort -u)
 [ -x "$apksigner" ] || stop "no apksigner at $apksigner (install build-tools 34.0.0)"
 if [ -z "$local_only" ]; then
     grep -q "^## $version" CHANGELOG.md || stop "CHANGELOG.md has no \"## $version\" section"
+    # The README's install steps name the files exactly, so they must name this release's.
+    for file in "glft-$version.apk" "glft_${version}_amd64.deb" "glft-$version-x86_64-linux.tar.gz"; do
+        grep -qF "$file" README.md || stop "README.md doesn't name $file; update its install steps"
+    done
+    stale=$(grep -oE 'glft[-_][0-9]+\.[0-9]+\.[0-9]+' README.md | grep -vxE "glft[-_]$(echo "$version" | sed 's/\./\\./g')" | sort -u)
+    [ -z "$stale" ] || stop "README.md still names another version: $stale"
     git ls-remote --exit-code --tags origin "$tag" >/dev/null || stop "$tag is not on GitHub yet: git push origin $tag"
 fi
 case $(stat -c %a "$keystore") in
